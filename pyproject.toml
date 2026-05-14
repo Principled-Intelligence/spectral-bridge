@@ -4,11 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "spectral-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Open protocol for testing network-isolated AI systems"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["websockets>=15.0", "httpx[http2]>=0.28", "click>=8.1", "rich>=13.0"]
+dependencies = [
+    "websockets>=15.0",
+    "httpx[http2]>=0.28",
+    "click>=8.1",
+    "rich>=13.0",
+]
 
 [project.optional-dependencies]
 pass-through = ["spectral-bridge-adapter-pass-through"]
