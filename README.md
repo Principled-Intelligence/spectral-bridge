@@ -4,6 +4,8 @@ Connect your private AI system to external testing and evaluation platforms — 
 
 `spectral-bridge` is a relay client that makes AI systems reachable to outside platforms over a single outbound connection, without exposing them to the internet or requiring firewall and VPN changes. Built on an open protocol any platform can adopt.
 
+Full documentation: [spectral.principled.app/docs](https://spectral.principled.app/docs)
+
 ## Who this is for
 
 **AI teams running models on private infrastructure.** If your AI system runs somewhere that isn't reachable from the public internet — inside a corporate VPN, on an air-gapped research cluster, on a private cloud subnet, or on a developer's laptop — you've probably hit a wall when trying to use external testing or evaluation platforms. They expect a public URL. You don't have one, and getting one means weeks of security review, firewall exceptions, or sharing VPN credentials with a third party.
@@ -69,7 +71,7 @@ An adapter is a thin translation layer that sits between `spectral-bridge` and y
 
 Adapters can be written in any language. Any process, container, or script that serves that endpoint qualifies.
 
-The built-in [`pass-through`](https://github.com/Principled-Intelligence/spectral-bridge/blob/main/adapters/pass-through/) adapter proxies to an existing OpenAI-compatible endpoint and covers most cases. If your AI system has a different shape, writing a custom adapter takes minimal effort — one HTTP endpoint, one JSON schema. See the [adapter documentation](https://spectral.com/docs/spectral-bridge/adapters/custom) for details.
+The built-in [`pass-through`](https://github.com/Principled-Intelligence/spectral-bridge/blob/main/adapters/pass-through/) adapter proxies to an existing OpenAI-compatible endpoint and covers most cases. If your AI system has a different shape, writing a custom adapter takes minimal effort — one HTTP endpoint, one JSON schema. See the [adapter documentation](https://spectral.principled.app/docs/spectral-bridge/adapters/custom) for details.
 
 ## Protocol
 
