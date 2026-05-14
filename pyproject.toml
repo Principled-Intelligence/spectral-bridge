@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "spectral-bridge"
 version = "0.1.1"
 description = "Open protocol for testing network-isolated AI systems"
+readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [

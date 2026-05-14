@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "spectral-bridge-adapter-pass-through"
 version = "0.1.1"
 description = "Pass-through adapter for spectral-bridge"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = ["fastapi>=0.135.2", "uvicorn>=0.42", "httpx>=0.28"]
