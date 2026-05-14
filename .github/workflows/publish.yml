@@ -1,0 +1,32 @@
+name: "Publish"
+
+on:
+  release:
+    types:
+      - created
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Build spectral-bridge
+        run: uv build
+      - name: Publish spectral-bridge
+        run: uv publish
+
+      - name: Build spectral-bridge-adapter-pass-through
+        run: uv build --directory adapters/pass-through
+      - name: Publish spectral-bridge-adapter-pass-through
+        run: uv publish --directory adapters/pass-through

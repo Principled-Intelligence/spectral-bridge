@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="340" viewBox="0 0 840 340" text-rendering="optimizeLegibility">
+
+  <style>
+    text { font-family: Inter, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; }
+    .zone-lbl  { font-size: 11px; font-weight: 600; letter-spacing: 1.5px; fill: #94a3b8; }
+    .card-name { font-size: 14px; font-weight: 600; fill: #0f172a; }
+    .card-sub  { font-size: 12px; font-weight: 500; fill: #475569; }
+    .arrow-lbl { font-size: 10px; font-weight: 500; fill: #2563eb; }
+  </style>
+
+  <defs>
+    <marker id="arr" markerWidth="12" markerHeight="10" refX="0" refY="4.5" orient="auto" markerUnits="userSpaceOnUse">
+      <polyline points="0 0, 9 4.5, 0 9" fill="none" stroke="#2563eb" stroke-width="1.5" stroke-linejoin="miter"/>
+    </marker>
+    <marker id="arr-gray" markerWidth="12" markerHeight="10" refX="0" refY="4.5" orient="auto" markerUnits="userSpaceOnUse">
+      <polyline points="0 0, 9 4.5, 0 9" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-linejoin="miter"/>
+    </marker>
+  </defs>
+
+  <!-- ─── ZONE BACKGROUNDS ─── -->
+  <rect x="0" y="0" width="420" height="340" fill="#f8fafc"/>
+  <rect x="420" y="0" width="420" height="340" fill="#f0f7ff"/>
+  <line x1="420" y1="44" x2="420" y2="296" stroke="#e2e8f0" stroke-width="1"/>
+
+  <!-- Zone labels -->
+  <text x="210" y="34" text-anchor="middle" class="zone-lbl">TESTING PLATFORM</text>
+  <text x="630" y="34" text-anchor="middle" class="zone-lbl">YOUR NETWORK</text>
+
+  <!-- ─── LEFT ZONE ─── -->
+
+  <!-- Testing Services -->
+  <rect x="100" y="70" width="220" height="46" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="210" y="98" text-anchor="middle" class="card-name">Testing Services</text>
+
+  <!-- Arrow: Testing Services → Relay Server -->
+  <path d="M 210,116 V 218" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr-gray)"/>
+
+  <!-- Relay Server -->
+  <rect x="100" y="228" width="220" height="46" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="210" y="256" text-anchor="middle" class="card-name">Relay Server</text>
+
+  <!-- ─── RIGHT ZONE ─── -->
+
+  <!-- Internal Services -->
+  <rect x="478" y="70" width="140" height="46" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="548" y="98" text-anchor="middle" class="card-name">Internal Services</text>
+
+  <!-- Your AI System (centered at x=710, aligned with Adapter) -->
+  <rect x="645" y="70" width="130" height="46" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="710" y="98" text-anchor="middle" class="card-name">Your AI System</text>
+
+  <!-- Local Device container -->
+  <rect x="468" y="200" width="314" height="86" rx="8" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="488" y="218" font-size="10" font-weight="600" letter-spacing="1px" fill="#94a3b8">LOCAL DEVICE</text>
+
+  <!-- Arrow: Adapter → Your AI System (drawn after container so it's visible) -->
+  <path d="M 710,228 V 126" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr-gray)"/>
+
+  <!-- spectral-bridge + Adapter row -->
+  <rect x="480" y="228" width="120" height="46" rx="6" fill="#f0f7ff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="540" y="256" text-anchor="middle" class="card-sub">spectral-bridge</text>
+
+  <rect x="650" y="228" width="120" height="46" rx="6" fill="#f0f7ff" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="710" y="256" text-anchor="middle" class="card-sub">Adapter</text>
+
+  <!-- Arrow: spectral-bridge → Adapter -->
+  <path d="M 600,251 H 641" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr-gray)"/>
+
+  <!-- ─── CROSS-ZONE CONNECTION ─── -->
+
+  <!-- spectral-bridge → Relay Server (outbound WebSocket) -->
+  <path id="ws-path" d="M 480,251 H 329" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <text x="400" y="242" text-anchor="middle" class="arrow-lbl">outbound WebSocket</text>
+
+  <!-- ─── ANIMATION: single packet round trip ─── -->
+  <!--
+    Waypoints follow arrow endpoints exactly. Speed = 118 px/s on real segments.
+    Total path length = 1424 px (including teleport diagonals).
+    Each hold = 0.2 s. Each teleport = 0.05 s. Total dur = 10 s.
+
+    W1  (210,116)  arrow 1 tail   [hold] move ↓
+    W2  (210,218)  arrow 1 head   [hold] teleport
+    W3  (329,251)  WS arrow head  [hold] move →   (packet: relay→SB)
+    W4  (480,251)  WS arrow tail  [hold] teleport
+    W5  (600,251)  arrow 3 tail   [hold] move →
+    W6  (641,251)  arrow 3 head   [hold] teleport
+    W7  (710,228)  arrow 4 tail   [hold] move ↑
+    W8  (710,126)  arrow 4 head   [hold] move ↓  (return)
+    W9  (710,228)  arrow 4 tail   [hold] teleport
+    W10 (641,251)  arrow 3 head   [hold] move ←
+    W11 (600,251)  arrow 3 tail   [hold] teleport
+    W12 (480,251)  WS arrow tail  [hold] move ←
+    W13 (329,251)  WS arrow head  [hold] teleport
+    W14 (210,218)  arrow 1 head   [hold] move ↑
+    W15 (210,116)  arrow 1 tail   [hold] → loop
+
+    keyPoint fractions (cumulative path length / 1424):
+      0.0000 0.0716 0.1583 0.2643 0.3485 0.3773 0.4284 0.5000
+      0.5716 0.6226 0.6514 0.7357 0.8416 0.9284 1.0000
+
+    keyTimes (each waypoint: arrive, then hold 0.2 s):
+      hold      arrive  hold-end
+      W1  0.000  —       0.020
+      W2  —      0.106   0.126
+      W3  —      0.131   0.151
+      W4  —      0.279   0.299
+      W5  —      0.304   0.324
+      W6  —      0.359   0.379
+      W7  —      0.384   0.404
+      W8  —      0.490   0.510
+      W9  —      0.596   0.616
+      W10 —      0.621   0.641
+      W11 —      0.676   0.696
+      W12 —      0.701   0.721
+      W13 —      0.849   0.869
+      W14 —      0.874   0.894
+      W15 —      0.980   1.000
+  -->
+  <circle r="4" fill="#2563eb">
+    <!-- Motion: follows arrow endpoints exactly, teleports in 50ms between disconnected arrows -->
+    <animateMotion dur="10s" repeatCount="indefinite" calcMode="linear"
+      path="M 210,116 L 210,218 L 329,251 L 480,251 L 600,251 L 641,251 L 710,228 L 710,126 L 710,228 L 641,251 L 600,251 L 480,251 L 329,251 L 210,218 L 210,116"
+      keyPoints="0.0000;0.0000;0.0716;0.0716;0.1583;0.1583;0.2643;0.2643;0.3485;0.3485;0.3773;0.3773;0.4284;0.4284;0.5000;0.5000;0.5716;0.5716;0.6226;0.6226;0.6514;0.6514;0.7357;0.7357;0.8416;0.8416;0.9284;0.9284;1.0000;1.0000"
+      keyTimes="0.000;0.020;0.106;0.126;0.131;0.151;0.279;0.299;0.304;0.324;0.359;0.379;0.384;0.404;0.490;0.530;0.616;0.636;0.641;0.661;0.696;0.716;0.721;0.741;0.869;0.889;0.894;0.914;1.000;1.000"/>
+    <!-- Opacity: fades out over the 200ms hold before each teleport, invisible during jump, fades in after -->
+    <animate attributeName="opacity" dur="10s" repeatCount="indefinite" calcMode="linear"
+      values="1;1;1;0;0;1;1;0;0;1;1;0;0;1;1;1;1;0;0;1;1;0;0;1;1;0;0;1;1;1"
+      keyTimes="0.000;0.020;0.106;0.126;0.131;0.151;0.279;0.299;0.304;0.324;0.359;0.379;0.384;0.404;0.490;0.530;0.616;0.636;0.641;0.661;0.696;0.716;0.721;0.741;0.869;0.889;0.894;0.914;1.000;1.000"/>
+  </circle>
+
+</svg>

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spectral-bridge-adapter-pass-through"
+version = "0.1.0"
+description = "Pass-through adapter for spectral-bridge"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.135.2", "uvicorn>=0.42", "httpx>=0.28"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spectral_bridge_passthrough"]

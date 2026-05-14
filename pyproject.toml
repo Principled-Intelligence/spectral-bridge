@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spectral-bridge"
+version = "0.1.0"
+description = "Open protocol for testing network-isolated AI systems"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["websockets>=15.0", "httpx[http2]>=0.28", "click>=8.1", "rich>=13.0"]
+
+[project.optional-dependencies]
+pass-through = ["spectral-bridge-adapter-pass-through"]
+
+[tool.uv.sources]
+spectral-bridge-adapter-pass-through = { path = "adapters/pass-through", editable = true }
+
+[project.scripts]
+spectral-bridge = "spectral_bridge.cli.main:cli"
+
+[dependency-groups]
+dev = [
+    "ty==0.0.1a23",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "spectral-bridge-adapter-pass-through",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "adapters/pass-through/tests"]
+addopts = "--import-mode=importlib"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spectral_bridge"]
+
+[tool.ty.src]
+exclude = []
