@@ -20,7 +20,11 @@ import click
 import httpx
 from rich.logging import RichHandler
 
-from spectral_bridge.client import DEFAULT_MAX_WS_MESSAGE_BYTES, RelayClient
+from spectral_bridge.client import (
+    DEFAULT_MAX_WS_MESSAGE_BYTES,
+    DEFAULT_REQUEST_TIMEOUT,
+    RelayClient,
+)
 
 logger = logging.getLogger("spectral_bridge.cli")
 
@@ -123,11 +127,20 @@ def cli() -> None:
     show_default=True,
     help="Maximum incoming WebSocket message size from the relay (bytes)",
 )
+@click.option(
+    "--request-timeout",
+    type=click.FloatRange(min=0, min_open=True),
+    default=DEFAULT_REQUEST_TIMEOUT,
+    show_default=True,
+    help="Max seconds to wait for the adapter to return a completion "
+    "(keep >= the relay server's RELAY_TIMEOUT_SECONDS)",
+)
 def start_relay(
     relay_url: str,
     adapter_url: str,
     insecure_relay: bool,
     max_ws_message_bytes: int,
+    request_timeout: float,
 ) -> None:
     """Connect the relay client to an already-running adapter."""
     api_key = _relay_api_key_from_env()
@@ -138,6 +151,7 @@ def start_relay(
             adapter_url,
             insecure_relay=insecure_relay,
             max_ws_message_bytes=max_ws_message_bytes,
+            request_timeout=request_timeout,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -175,6 +189,14 @@ def start_relay(
     show_default=True,
     help="Maximum incoming WebSocket message size from the relay (bytes)",
 )
+@click.option(
+    "--request-timeout",
+    type=click.FloatRange(min=0, min_open=True),
+    default=DEFAULT_REQUEST_TIMEOUT,
+    show_default=True,
+    help="Max seconds to wait for the adapter to return a completion "
+    "(keep >= the relay server's RELAY_TIMEOUT_SECONDS)",
+)
 def start(
     relay_url: str,
     adapter: str,
@@ -182,6 +204,7 @@ def start(
     port: int,
     insecure_relay: bool,
     max_ws_message_bytes: int,
+    request_timeout: float,
 ) -> None:
     """Start a built-in adapter and connect the relay client."""
     api_key = _relay_api_key_from_env()
@@ -208,6 +231,7 @@ def start(
             adapter_url,
             insecure_relay=insecure_relay,
             max_ws_message_bytes=max_ws_message_bytes,
+            request_timeout=request_timeout,
         )
     except ValueError as exc:
         proc.terminate()

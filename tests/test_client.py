@@ -1,9 +1,16 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
 
-from spectral_bridge.client import RelayClient, _headers_for_adapter
+import spectral_bridge.client as client_mod
+from spectral_bridge.client import (
+    DEFAULT_REQUEST_TIMEOUT,
+    RelayClient,
+    _headers_for_adapter,
+)
 
 # ── _headers_for_adapter ─────────────────────────────────────────────────────
 
@@ -98,10 +105,79 @@ def test_validate_max_bytes_zero_raises():
 
 # ── Integration helpers ───────────────────────────────────────────────────────
 
+DEFAULT_BODY = {"model": "test", "messages": [{"role": "user", "content": "hello"}]}
+
 
 def _client(relay_url: str, adapter_url: str, **kwargs) -> RelayClient:
-    """Convenience: build a RelayClient with insecure_relay=True for ws:// test URLs."""
+    """Build a RelayClient with insecure_relay=True for the ws:// test URLs."""
     return RelayClient(relay_url, "any-key", adapter_url, insecure_relay=True, **kwargs)
+
+
+def request_frame(request_id: str, body: dict | None = None) -> dict:
+    """A relay 'request' frame for `request_id` (default chat-completion body)."""
+    return {
+        "type": "request",
+        "request_id": request_id,
+        "payload": {
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": {},
+            "body": DEFAULT_BODY if body is None else body,
+        },
+    }
+
+
+@asynccontextmanager
+async def running_client(client: RelayClient):
+    """Run `client.run()` in the background, cancelling it cleanly on exit."""
+    task = asyncio.create_task(client.run())
+    try:
+        yield task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.fixture
+def roundtrip(make_relay_server):
+    """
+    Drive the real client against a scripted relay. The relay sends one request
+    frame per id; the client forwards each to `adapter_url` and the relay collects
+    the responses. Returns {request_id: response_frame}.
+
+    Only the relay is faked — the client and the adapter behind `adapter_url` are
+    the real thing, so swapping `adapter_url` (echo, unreachable, slow) is all it
+    takes to cover the different forwarding outcomes.
+    """
+
+    async def _roundtrip(
+        adapter_url: str,
+        request_ids: list[str],
+        *,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    ) -> dict[str, dict]:
+        responses: dict[str, dict] = {}
+        done = asyncio.Event()
+
+        async def relay(ws):
+            await ws.send(json.dumps({"type": "connected"}))
+            # send every request before reading any response, so concurrent
+            # handling is exercised when more than one id is requested
+            for request_id in request_ids:
+                await ws.send(json.dumps(request_frame(request_id)))
+            for _ in request_ids:
+                frame = json.loads(await ws.recv())
+                responses[frame["request_id"]] = frame
+            done.set()
+            await ws.recv()  # hold the connection open until the client is torn down
+
+        url = await make_relay_server(relay)
+        client = _client(url, adapter_url, request_timeout=request_timeout)
+        async with running_client(client):
+            await asyncio.wait_for(done.wait(), timeout=15)
+        return responses
+
+    return _roundtrip
 
 
 # ── Connection and authentication ─────────────────────────────────────────────
@@ -111,26 +187,24 @@ async def test_connected_frame_accepted(make_relay_server, adapter_url):
     """Client connects and stays running after receiving the connected frame."""
     ready = asyncio.Event()
 
-    async def handler(ws):
+    async def relay(ws):
         await ws.send(json.dumps({"type": "connected"}))
         ready.set()
         await ws.recv()
 
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, adapter_url).run())
-    await asyncio.wait_for(ready.wait(), timeout=5)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(ready.wait(), timeout=5)
 
 
 async def test_auth_failure_4001_stops_client(make_relay_server, adapter_url):
     """Server closes with code 4001 → run() returns without retrying."""
 
-    async def handler(ws):
+    async def relay(ws):
         await ws.close(code=4001, reason="unauthorized")
 
-    url = await make_relay_server(handler)
-    # run() must complete (not loop forever); 5-second timeout proves it stops
+    url = await make_relay_server(relay)
+    # run() must complete (not loop forever); the timeout proves it stops
     await asyncio.wait_for(_client(url, adapter_url).run(), timeout=5)
 
 
@@ -149,8 +223,7 @@ async def test_auth_failure_401_stops_client(adapter_url):
         await writer.wait_closed()
 
     server = await asyncio.start_server(serve_401, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    url = f"ws://127.0.0.1:{port}"
+    url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
     try:
         await asyncio.wait_for(_client(url, adapter_url).run(), timeout=5)
     finally:
@@ -159,207 +232,65 @@ async def test_auth_failure_401_stops_client(adapter_url):
 
 
 async def test_unexpected_first_frame_reconnects(make_relay_server, adapter_url):
-    """
-    Server sends an unexpected frame type before 'connected'.
-    The client raises ProtocolError (a WebSocketException), which the retry loop
-    catches — so the client reconnects rather than stopping.
-    """
+    """An unexpected first frame raises ProtocolError; the retry loop reconnects."""
     connection_count = 0
-    second_connection = asyncio.Event()
+    reconnected = asyncio.Event()
 
-    async def handler(ws):
+    async def relay(ws):
         nonlocal connection_count
         connection_count += 1
         if connection_count == 1:
             await ws.send(json.dumps({"type": "hello"}))  # not "connected"
         else:
-            second_connection.set()
+            reconnected.set()
             await ws.recv()
 
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, adapter_url).run())
-    # After ProtocolError + backoff (≥1 s), client reconnects
-    await asyncio.wait_for(second_connection.wait(), timeout=10)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(reconnected.wait(), timeout=10)
     assert connection_count == 2
 
 
 # ── Request forwarding ────────────────────────────────────────────────────────
 
 
-async def test_request_forwarded_and_response_echoed(make_relay_server, adapter_url):
-    """Fake relay sends a request frame → client POSTs to adapter → relay receives a response frame."""
-    received = asyncio.Queue()
-
-    async def handler(ws):
-        await ws.send(json.dumps({"type": "connected"}))
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "request",
-                    "request_id": "req-1",
-                    "payload": {
-                        "method": "POST",
-                        "path": "/v1/chat/completions",
-                        "headers": {},
-                        "body": {
-                            "model": "test",
-                            "messages": [{"role": "user", "content": "hello"}],
-                        },
-                    },
-                }
-            )
-        )
-        raw = await ws.recv()
-        await received.put(json.loads(raw))
-        await ws.recv()
-
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, adapter_url).run())
-    response = await asyncio.wait_for(received.get(), timeout=10)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
+async def test_request_forwarded_and_response_echoed(roundtrip, adapter_url):
+    """Client forwards a request to the adapter and echoes the response, id intact."""
+    response = (await roundtrip(adapter_url, ["req-1"]))["req-1"]
     assert response["type"] == "response"
+    assert response["request_id"] == "req-1"
     assert response["payload"]["status"] == 200
     assert response["payload"]["body"]["choices"][0]["message"]["content"] == "ok"
 
 
-async def test_response_request_id_matches(make_relay_server, adapter_url):
-    """request_id in the response frame matches the one in the request frame exactly."""
-    received = asyncio.Queue()
-    distinctive_id = "my-unique-request-id-xyz"
+async def test_adapter_unavailable_sends_503(roundtrip):
+    """An unreachable adapter yields a 503 response frame."""
+    # Bind on port 0 then close immediately, so nothing is listening there.
+    dead = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    dead_url = f"http://127.0.0.1:{dead.sockets[0].getsockname()[1]}"
+    dead.close()
+    await dead.wait_closed()
 
-    async def handler(ws):
-        await ws.send(json.dumps({"type": "connected"}))
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "request",
-                    "request_id": distinctive_id,
-                    "payload": {
-                        "method": "POST",
-                        "path": "/v1/chat/completions",
-                        "headers": {},
-                        "body": {
-                            "model": "test",
-                            "messages": [{"role": "user", "content": "hello"}],
-                        },
-                    },
-                }
-            )
-        )
-        raw = await ws.recv()
-        await received.put(json.loads(raw))
-        await ws.recv()
-
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, adapter_url).run())
-    response = await asyncio.wait_for(received.get(), timeout=10)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-    assert response["request_id"] == distinctive_id
-
-
-async def test_adapter_unavailable_sends_503(make_relay_server):
-    """Adapter URL is unreachable → client sends a response frame with status 503."""
-    # Bind on port 0 (OS picks a free port), then close immediately so nothing is listening.
-    _srv = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
-    _port = _srv.sockets[0].getsockname()[1]
-    _srv.close()
-    await _srv.wait_closed()
-    dead_url = f"http://127.0.0.1:{_port}"
-
-    received = asyncio.Queue()
-
-    async def handler(ws):
-        await ws.send(json.dumps({"type": "connected"}))
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "request",
-                    "request_id": "req-dead",
-                    "payload": {
-                        "method": "POST",
-                        "path": "/v1/chat/completions",
-                        "headers": {},
-                        "body": {
-                            "model": "test",
-                            "messages": [{"role": "user", "content": "hello"}],
-                        },
-                    },
-                }
-            )
-        )
-        raw = await ws.recv()
-        await received.put(json.loads(raw))
-        await ws.recv()
-
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, dead_url).run())
-    response = await asyncio.wait_for(received.get(), timeout=10)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-    assert response["type"] == "response"
+    response = (await roundtrip(dead_url, ["req-dead"]))["req-dead"]
     assert response["payload"]["status"] == 503
 
 
 # ── Resilience ────────────────────────────────────────────────────────────────
 
 
-async def test_concurrent_requests_both_answered(make_relay_server, adapter_url):
-    """Relay sends two request frames before reading any response → both handled concurrently → two response frames received with status 200."""
-    responses = asyncio.Queue()
-
-    async def handler(ws):
-        await ws.send(json.dumps({"type": "connected"}))
-        # Send both frames immediately, before reading any response
-        for req_id in ("req-a", "req-b"):
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "request",
-                        "request_id": req_id,
-                        "payload": {
-                            "method": "POST",
-                            "path": "/v1/chat/completions",
-                            "headers": {},
-                            "body": {
-                                "model": "test",
-                                "messages": [{"role": "user", "content": "hello"}],
-                            },
-                        },
-                    }
-                )
-            )
-        # Collect both responses (order may vary)
-        r1 = json.loads(await ws.recv())
-        r2 = json.loads(await ws.recv())
-        responses.put_nowait(r1)
-        responses.put_nowait(r2)
-        await ws.recv()
-
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, adapter_url).run())
-    r1 = await asyncio.wait_for(responses.get(), timeout=10)
-    r2 = await asyncio.wait_for(responses.get(), timeout=10)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-    assert {r1["request_id"], r2["request_id"]} == {"req-a", "req-b"}
-    assert r1["payload"]["status"] == 200
-    assert r2["payload"]["status"] == 200
+async def test_concurrent_requests_both_answered(roundtrip, adapter_url):
+    """Two requests sent before either response is read are both answered."""
+    responses = await roundtrip(adapter_url, ["req-a", "req-b"])
+    assert set(responses) == {"req-a", "req-b"}
+    assert all(r["payload"]["status"] == 200 for r in responses.values())
 
 
 async def test_reconnects_after_disconnect(make_relay_server, adapter_url):
-    """First relay connection closes with code 1001 → client reconnects → second connection is reached."""
+    """A clean server close (code 1001) triggers a reconnect."""
     connection_count = 0
     reconnected = asyncio.Event()
 
-    async def handler(ws):
+    async def relay(ws):
         nonlocal connection_count
         connection_count += 1
         if connection_count == 1:
@@ -369,28 +300,159 @@ async def test_reconnects_after_disconnect(make_relay_server, adapter_url):
             reconnected.set()
             await ws.recv()
 
-    url = await make_relay_server(handler)
-    task = asyncio.create_task(_client(url, adapter_url).run())
-    # Allow up to 10s to accommodate the 1s backoff after the first disconnect
-    await asyncio.wait_for(reconnected.wait(), timeout=10)
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(reconnected.wait(), timeout=10)
     assert connection_count == 2
 
 
+async def test_abnormal_closure_reconnects(make_relay_server, adapter_url):
+    """
+    An infra-style disconnect — TCP severed with no close frame (the 1006
+    "no close frame received or sent" case, e.g. a proxy or Cloud Run request-
+    timeout recycle) — is transient: the client reconnects rather than stopping.
+    """
+    connection_count = 0
+    reconnected = asyncio.Event()
+
+    async def relay(ws):
+        nonlocal connection_count
+        connection_count += 1
+        if connection_count == 1:
+            await ws.send(json.dumps({"type": "connected"}))
+            ws.transport.abort()  # sever TCP with no close frame -> client sees 1006
+        else:
+            reconnected.set()
+            await ws.recv()
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(reconnected.wait(), timeout=10)
+    assert connection_count == 2
+
+
+# ── Reconnect backoff ─────────────────────────────────────────────────────────
+
+
+async def _capture_backoff_delays(monkeypatch, *, stable_threshold: float) -> list:
+    """
+    Drive run()'s reconnect loop with an always-failing connection, capturing the
+    backoff delay used on each iteration. _connect is stubbed to fail immediately
+    and asyncio.sleep is stubbed to record (not wait), so no real network or time
+    is involved; only the loop's delay arithmetic is exercised.
+    """
+    client = _client("ws://relay.test/connect", "http://localhost:1")
+    monkeypatch.setattr(client_mod, "BACKOFF_SCHEDULE", [1, 2, 4, 8])
+    monkeypatch.setattr(client_mod, "STABLE_CONNECTION_THRESHOLD", stable_threshold)
+
+    delays: list = []
+
+    async def fake_connect():
+        # abnormal closure, no close frame -> falls through to the backoff branch
+        raise ConnectionClosedError(None, None)
+
+    # Patching asyncio.sleep is global, so it also hits background servers (e.g. the
+    # session-scoped adapter) running on other event loops. Record and short-circuit
+    # only this loop's backoff sleeps; let every other loop sleep for real.
+    loop = asyncio.get_running_loop()
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if asyncio.get_running_loop() is not loop:
+            await real_sleep(delay)
+            return
+        delays.append(delay)
+        if len(delays) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(client, "_connect", fake_connect)
+    monkeypatch.setattr(client_mod.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.run()
+    return delays
+
+
+async def test_backoff_escalates_without_stable_connection(monkeypatch):
+    """Rapid failures (each connection well under the stable threshold) escalate."""
+    delays = await _capture_backoff_delays(monkeypatch, stable_threshold=9999)
+    assert delays == [1, 2, 4, 8]
+
+
+async def test_backoff_resets_after_stable_connection(monkeypatch):
+    """
+    Each connection that stays up past the stable threshold resets the counter,
+    so the backoff never escalates — the regression behind the 4→8→30→30 climb
+    seen across healthy ~5-minute sessions.
+    """
+    # threshold 0 => every connection counts as stable => reset on every iteration
+    delays = await _capture_backoff_delays(monkeypatch, stable_threshold=0)
+    assert delays == [1, 1, 1, 1]
+
+
+# ── Long-running completions ──────────────────────────────────────────────────
+
+
+def _slow_completion_app(delay: float):
+    """ASGI app that waits `delay` seconds before returning a valid completion."""
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        await asyncio.sleep(delay)
+        body = json.dumps(
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    return app
+
+
+async def test_short_request_timeout_times_out_slow_adapter(
+    roundtrip, make_asgi_server
+):
+    """A completion slower than request_timeout fails with 503 (adapter timed out)."""
+    slow_url = make_asgi_server(_slow_completion_app(0.5))
+    response = (await roundtrip(slow_url, ["slow"], request_timeout=0.2))["slow"]
+    assert response["payload"]["status"] == 503
+
+
+async def test_generous_request_timeout_allows_slow_adapter(
+    roundtrip, make_asgi_server
+):
+    """The same slow completion succeeds when request_timeout is generous."""
+    slow_url = make_asgi_server(_slow_completion_app(0.5))
+    response = (await roundtrip(slow_url, ["slow"], request_timeout=5.0))["slow"]
+    assert response["payload"]["status"] == 200
+    assert response["payload"]["body"]["choices"][0]["message"]["content"] == "ok"
+
+
+# ── Frame size limit ──────────────────────────────────────────────────────────
+
+
 async def test_payload_too_big_stops_client(make_relay_server):
-    """Relay sends a frame larger than max_ws_message_bytes → PayloadTooBig → run() returns without retrying."""
-    # The "connected" frame is ~23 bytes; use a limit large enough to receive it
-    # but smaller than the 100-byte oversized frame.
+    """A frame larger than max_ws_message_bytes → PayloadTooBig → run() returns."""
+    # The "connected" frame is ~23 bytes; the limit must admit it but reject the
+    # 100-byte oversized frame that follows.
     max_bytes = 50
 
-    async def handler(ws):
+    async def relay(ws):
         await ws.send(json.dumps({"type": "connected"}))
         await ws.send("x" * 100)  # exceeds max_ws_message_bytes
         await ws.recv()
 
-    url = await make_relay_server(handler)
+    url = await make_relay_server(relay)
     # run() must complete; PayloadTooBig triggers an immediate return, not a retry
     await asyncio.wait_for(
         _client(url, "http://localhost:1", max_ws_message_bytes=max_bytes).run(),

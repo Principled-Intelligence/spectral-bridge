@@ -71,6 +71,29 @@ def adapter_url(echo_target_url):
     thread.join(timeout=5)
 
 
+# ── Per-test ASGI server factory ──────────────────────────────────────────────
+
+@pytest.fixture
+def make_asgi_server():
+    """
+    Factory fixture. Call `url = make_asgi_server(app)` to start an arbitrary
+    ASGI app in a background thread; used for adapters with custom behaviour
+    (e.g. a deliberately slow target). All servers stop when the test ends.
+    """
+    started = []
+
+    def factory(app) -> str:
+        server, thread, url = _start_background_server(app)
+        started.append((server, thread))
+        return url
+
+    yield factory
+
+    for server, thread in started:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
 # ── Per-test relay server factory ─────────────────────────────────────────────
 
 @pytest.fixture

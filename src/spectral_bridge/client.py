@@ -37,6 +37,12 @@ ADAPTER_CHAT_PATH = "/v1/chat/completions"
 
 DEFAULT_MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
 
+# Max time to wait for the adapter to return a completion. Long completions are
+# real, so this is generous; keep it >= the relay server's RELAY_TIMEOUT_SECONDS
+# so the server is the authority on giving up rather than the client.
+DEFAULT_REQUEST_TIMEOUT = 600.0
+_CONNECT_TIMEOUT = 10.0
+
 # Strip hop-by-hop / connection-specific fields when rebuilding a POST to localhost.
 _HOP_BY_HOP_HEADERS = frozenset(
     {
@@ -75,13 +81,17 @@ class RelayClient:
         *,
         insecure_relay: bool = False,
         max_ws_message_bytes: int = DEFAULT_MAX_WS_MESSAGE_BYTES,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ) -> None:
         if max_ws_message_bytes < 1:
             raise ValueError("max_ws_message_bytes must be at least 1")
+        if request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
         self.relay_url = relay_url
         self.api_key = api_key
         self.adapter_url = adapter_url.rstrip("/")
         self._max_ws_message_bytes = max_ws_message_bytes
+        self._request_timeout = request_timeout
         self._http: httpx.AsyncClient | None = None
         self._tasks: set[asyncio.Task] = set()
         self._validate_relay_url(insecure_relay)
@@ -110,14 +120,16 @@ class RelayClient:
 
     async def run(self) -> None:
         attempt = 0
-        self._http = httpx.AsyncClient(timeout=30)
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(self._request_timeout, connect=_CONNECT_TIMEOUT)
+        )
         try:
             while True:
+                t0 = time.monotonic()
                 try:
-                    t0 = time.monotonic()
                     await self._connect()
-                    if time.monotonic() - t0 >= STABLE_CONNECTION_THRESHOLD:
-                        attempt = 0
+                    # clean close (server sent a close frame)
+                    reason = "connection closed"
                 except ConnectionClosedError as exc:
                     if exc.rcvd is not None and exc.rcvd.code == 4001:
                         logger.error("authentication failed")
@@ -125,22 +137,31 @@ class RelayClient:
                     sent_1009 = exc.sent is not None and exc.sent.code == 1009
                     rcvd_1009 = exc.rcvd is not None and exc.rcvd.code == 1009
                     if sent_1009 or rcvd_1009:
-                        logger.error("relay frame exceeded max size (%d bytes)", self._max_ws_message_bytes)
+                        logger.error(
+                            "relay frame exceeded max size (%d bytes)",
+                            self._max_ws_message_bytes,
+                        )
                         return
-                    delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
-                    logger.warning("disconnected (%s), reconnecting in %ds", exc, delay)
-                    await asyncio.sleep(delay)
-                    attempt += 1
+                    reason = str(exc)
                 except InvalidStatus as exc:
                     if exc.response.status_code == 401:
                         logger.error("authentication failed")
                         return
                     raise
                 except (OSError, WebSocketException) as exc:
-                    delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
-                    logger.warning("disconnected (%s), reconnecting in %ds", exc, delay)
-                    await asyncio.sleep(delay)
-                    attempt += 1
+                    reason = str(exc)
+
+                # A connection that stayed up long enough is considered healthy,
+                # so the next disconnect starts backoff from scratch. This reset
+                # must happen on every disconnect path (abnormal closures raise
+                # rather than return), otherwise transient drops accumulate and
+                # the delay keeps escalating even between healthy sessions.
+                if time.monotonic() - t0 >= STABLE_CONNECTION_THRESHOLD:
+                    attempt = 0
+                delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
+                logger.warning("disconnected (%s), reconnecting in %ds", reason, delay)
+                await asyncio.sleep(delay)
+                attempt += 1
         finally:
             await self._cancel_inflight_handlers()
             if self._http is not None:
