@@ -431,12 +431,16 @@ dependencies = [
 pass-through = [
     { name = "spectral-bridge-adapter-pass-through" },
 ]
+responses-passthrough = [
+    { name = "spectral-bridge-adapter-responses-passthrough" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "spectral-bridge-adapter-pass-through" },
+    { name = "spectral-bridge-adapter-responses-passthrough" },
     { name = "ty" },
 ]
 
@@ -446,15 +450,17 @@ requires-dist = [
     { name = "httpx", extras = ["http2"], specifier = ">=0.28" },
     { name = "rich", specifier = ">=13.0" },
     { name = "spectral-bridge-adapter-pass-through", marker = "extra == 'pass-through'", editable = "adapters/pass-through" },
+    { name = "spectral-bridge-adapter-responses-passthrough", marker = "extra == 'responses-passthrough'", editable = "adapters/responses-passthrough" },
     { name = "websockets", specifier = ">=15.0" },
 ]
-provides-extras = ["pass-through"]
+provides-extras = ["pass-through", "responses-passthrough"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "spectral-bridge-adapter-pass-through", editable = "adapters/pass-through" },
+    { name = "spectral-bridge-adapter-responses-passthrough", editable = "adapters/responses-passthrough" },
     { name = "ty", specifier = "==0.0.1a23" },
 ]
 
@@ -462,6 +468,23 @@ dev = [
 name = "spectral-bridge-adapter-pass-through"
 version = "0.1.4"
 source = { editable = "adapters/pass-through" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.135.2" },
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "uvicorn", specifier = ">=0.42" },
+]
+
+[[package]]
+name = "spectral-bridge-adapter-responses-passthrough"
+version = "0.1.0"
+source = { editable = "adapters/responses-passthrough" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
