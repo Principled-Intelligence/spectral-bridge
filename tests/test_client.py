@@ -282,7 +282,8 @@ async def test_adapter_unavailable_sends_503(roundtrip):
 
 
 async def test_responses_frame_round_trips(roundtrip, responses_adapter_url):
-    """A path:/v1/responses frame reaches the responses adapter and echoes back."""
+    """A path:/v1/responses frame reaches the pass-through adapter's
+    /v1/responses route (backed by the fake Responses target) and echoes back."""
     response = (
         await roundtrip(
             responses_adapter_url,

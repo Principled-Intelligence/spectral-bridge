@@ -125,14 +125,24 @@ def responses_target_url():
     thread.join(timeout=5)
 
 
-@pytest.fixture(scope="session")
-def responses_adapter_url(responses_target_url):
-    import spectral_bridge_responses.app as adapter_mod
+@pytest.fixture
+def responses_adapter_url(adapter_url, responses_target_url):
+    """
+    The already-running pass-through adapter (`adapter_url`), temporarily
+    repointed at the fake Responses target for the duration of one test.
+
+    The consolidated adapter is a single instance backed by one module-level
+    `TARGET_URL`, serving both `/v1/chat/completions` and `/v1/responses` (see
+    PROTOCOL.md / the responses-api-bridge design doc). Spinning up a *second*
+    uvicorn server around the same shared `app` singleton would clobber the
+    `adapter_url` fixture's `app.state.http_client` on startup/shutdown, so
+    tests instead reuse the one running instance and swap its target.
+    """
+    import spectral_bridge_passthrough.app as adapter_mod
+    original_target = adapter_mod.TARGET_URL
     adapter_mod.TARGET_URL = responses_target_url
-    server, thread, url = _start_background_server(adapter_mod.app)
-    yield url
-    server.should_exit = True
-    thread.join(timeout=5)
+    yield adapter_url
+    adapter_mod.TARGET_URL = original_target
 
 
 # ── Per-test ASGI server factory ──────────────────────────────────────────────
