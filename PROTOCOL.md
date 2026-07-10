@@ -14,13 +14,16 @@ Any conforming implementation of either client-facing component (adapter or rela
 
 An adapter is any process that **translates** a local target into an OpenAI-compatible HTTP server, acting as a semantic boundary: only the chatbot's text response is forwarded — no raw network traffic from the internal host crosses the boundary. The relay client forwards requests to it over localhost and expects responses in the format below.
 
-### Required Endpoint
+### Required Endpoints
+
+An adapter implements one or both of the following, depending on the API it proxies. The relay client forwards each request to the endpoint named by the request frame's `path` field (see §2.2), defaulting to `/v1/chat/completions`.
 
 ```
-POST /v1/chat/completions
+POST /v1/chat/completions   (Chat Completions API)
+POST /v1/responses          (OpenAI Responses API)
 ```
 
-The adapter must implement this endpoint. No other endpoints are required.
+No other endpoints are required. An adapter that proxies only one API need only implement that endpoint.
 
 ### Request Format
 
@@ -76,6 +79,43 @@ The relay client will propagate the status code and body back to the relay serve
 
 The adapter must handle concurrent requests. The relay client may forward multiple requests simultaneously (one per active conversation turn).
 
+### Responses API endpoint
+
+For targets that speak the OpenAI **Responses API**, the adapter implements:
+
+```
+POST /v1/responses
+```
+
+**Request format.** The relay client forwards a Responses request. `input` is either a string or a list of input items; arbitrary additional Responses fields (e.g. `tools`, `instructions`, `metadata`) pass through untouched:
+
+```json
+{
+  "input": "string or [ ...input items... ]",
+  "model": "optional"
+}
+```
+
+**Response format.** The adapter returns the Responses body verbatim — an `output` array of items:
+
+```json
+{
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [{ "type": "output_text", "text": "string" }]
+    }
+  ]
+}
+```
+
+Additional fields (`id`, `usage`, `status`, etc.) are optional and passed through.
+
+**Error responses.** As with the chat endpoint, failures return a standard `4xx`/`5xx` status with `{"error": {"message": "..."}}`.
+
+**Non-streaming.** The Responses path is non-streaming end to end: the adapter buffers a single JSON response. A `stream: true` request is not supported.
+
 ## 2. Relay Client Protocol
 
 The relay client maintains a persistent, bidirectional WebSocket connection to the relay server. The connection is **initiated outbound** by the client — no inbound ports or firewall rules are required. Once established, the server pushes request frames down to the client, and the client pushes response frames back up.
@@ -120,6 +160,7 @@ All WebSocket frames carry UTF-8 encoded JSON. Two message types are defined.
   "request_id": "<opaque string>",
   "payload": {
     "method": "POST",
+    "path": "/v1/chat/completions",
     "headers": {},
     "body": {}
   }
@@ -128,7 +169,7 @@ All WebSocket frames carry UTF-8 encoded JSON. Two message types are defined.
 
 `request_id` is assigned by the relay server. It is opaque to the client — treat it as a correlation token and echo it back unchanged in the response.
 
-The relay client always forwards requests to the adapter's `POST /v1/chat/completions` endpoint.
+`path` names the adapter endpoint the request targets (e.g. `/v1/chat/completions` or `/v1/responses`). The relay client forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions` for backward compatibility.
 
 #### Outbound: Response frame (client → server)
 
