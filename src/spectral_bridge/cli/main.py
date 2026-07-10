@@ -43,10 +43,6 @@ ADAPTERS = {
         "module": "spectral_bridge_passthrough.app:app",
         "env_key": "TARGET_URL",
     },
-    "responses-passthrough": {
-        "module": "spectral_bridge_responses.app:app",
-        "env_key": "TARGET_URL",
-    },
 }
 
 

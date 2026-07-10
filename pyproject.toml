@@ -18,11 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 pass-through = ["spectral-bridge-adapter-pass-through"]
-responses-passthrough = ["spectral-bridge-adapter-responses-passthrough"]
 
 [tool.uv.sources]
 spectral-bridge-adapter-pass-through = { path = "adapters/pass-through", editable = true }
-spectral-bridge-adapter-responses-passthrough = { path = "adapters/responses-passthrough", editable = true }
 
 [project.scripts]
 spectral-bridge = "spectral_bridge.cli.main:cli"
@@ -33,12 +31,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "spectral-bridge-adapter-pass-through",
-    "spectral-bridge-adapter-responses-passthrough",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "adapters/pass-through/tests", "adapters/responses-passthrough/tests"]
+testpaths = ["tests", "adapters/pass-through/tests"]
 addopts = "--import-mode=importlib"
 
 [tool.hatch.build.targets.wheel]

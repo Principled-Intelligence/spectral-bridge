@@ -30,8 +30,3 @@ jobs:
         run: uv build --directory adapters/pass-through
       - name: Publish spectral-bridge-adapter-pass-through
         run: uv publish --directory adapters/pass-through
-
-      - name: Build spectral-bridge-adapter-responses-passthrough
-        run: uv build --directory adapters/responses-passthrough
-      - name: Publish spectral-bridge-adapter-responses-passthrough
-        run: uv publish --directory adapters/responses-passthrough
