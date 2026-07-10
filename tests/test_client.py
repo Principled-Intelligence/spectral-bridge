@@ -113,14 +113,18 @@ def _client(relay_url: str, adapter_url: str, **kwargs) -> RelayClient:
     return RelayClient(relay_url, "any-key", adapter_url, insecure_relay=True, **kwargs)
 
 
-def request_frame(request_id: str, body: dict | None = None) -> dict:
+def request_frame(
+    request_id: str,
+    body: dict | None = None,
+    path: str = "/v1/chat/completions",
+) -> dict:
     """A relay 'request' frame for `request_id` (default chat-completion body)."""
     return {
         "type": "request",
         "request_id": request_id,
         "payload": {
             "method": "POST",
-            "path": "/v1/chat/completions",
+            "path": path,
             "headers": {},
             "body": DEFAULT_BODY if body is None else body,
         },
@@ -154,6 +158,8 @@ def roundtrip(make_relay_server):
         adapter_url: str,
         request_ids: list[str],
         *,
+        path: str = "/v1/chat/completions",
+        body: dict | None = None,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ) -> dict[str, dict]:
         responses: dict[str, dict] = {}
@@ -164,7 +170,7 @@ def roundtrip(make_relay_server):
             # send every request before reading any response, so concurrent
             # handling is exercised when more than one id is requested
             for request_id in request_ids:
-                await ws.send(json.dumps(request_frame(request_id)))
+                await ws.send(json.dumps(request_frame(request_id, body=body, path=path)))
             for _ in request_ids:
                 frame = json.loads(await ws.recv())
                 responses[frame["request_id"]] = frame
@@ -273,6 +279,23 @@ async def test_adapter_unavailable_sends_503(roundtrip):
 
     response = (await roundtrip(dead_url, ["req-dead"]))["req-dead"]
     assert response["payload"]["status"] == 503
+
+
+async def test_responses_frame_round_trips(roundtrip, responses_adapter_url):
+    """A path:/v1/responses frame reaches the responses adapter and echoes back."""
+    response = (
+        await roundtrip(
+            responses_adapter_url,
+            ["resp-1"],
+            path="/v1/responses",
+            body={"model": "spectral-internal", "input": "ping"},
+        )
+    )["resp-1"]
+    assert response["type"] == "response"
+    assert response["request_id"] == "resp-1"
+    assert response["payload"]["status"] == 200
+    output = response["payload"]["body"]["output"]
+    assert output[0]["content"][0]["text"] == "ping"
 
 
 # ── Frame path forwarding ─────────────────────────────────────────────────────
