@@ -275,6 +275,84 @@ async def test_adapter_unavailable_sends_503(roundtrip):
     assert response["payload"]["status"] == 503
 
 
+# ── Frame path forwarding ─────────────────────────────────────────────────────
+
+
+def _path_recording_app(recorder: list):
+    """ASGI app that records the request path and returns a minimal 200 JSON."""
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        recorder.append(scope["path"])
+        body = b'{"ok": true}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    return app
+
+
+async def _drive_one_frame(make_relay_server, adapter_url: str, frame: dict) -> dict:
+    """Send a single request frame to a real client; return the response frame."""
+    result: dict = {}
+    done = asyncio.Event()
+
+    async def relay(ws):
+        await ws.send(json.dumps({"type": "connected"}))
+        await ws.send(json.dumps(frame))
+        result["response"] = json.loads(await ws.recv())
+        done.set()
+        await ws.recv()  # hold open until the client is torn down
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(done.wait(), timeout=15)
+    return result["response"]
+
+
+async def test_frame_path_forwarded_to_adapter(make_relay_server, make_asgi_server):
+    """A frame carrying path:/v1/responses forwards to the adapter's /v1/responses."""
+    recorder: list = []
+    target_url = make_asgi_server(_path_recording_app(recorder))
+    frame = {
+        "type": "request",
+        "request_id": "resp-1",
+        "payload": {
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": {},
+            "body": {"input": "hi"},
+        },
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["status"] == 200
+    assert recorder == ["/v1/responses"]
+
+
+async def test_absent_frame_path_defaults_to_chat(make_relay_server, make_asgi_server):
+    """A frame with no path field still forwards to /v1/chat/completions."""
+    recorder: list = []
+    target_url = make_asgi_server(_path_recording_app(recorder))
+    frame = {
+        "type": "request",
+        "request_id": "chat-1",
+        "payload": {"method": "POST", "headers": {}, "body": DEFAULT_BODY},  # no "path"
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["status"] == 200
+    assert recorder == ["/v1/chat/completions"]
+
+
 # ── Resilience ────────────────────────────────────────────────────────────────
 
 
