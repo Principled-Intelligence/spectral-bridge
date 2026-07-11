@@ -33,7 +33,7 @@ The core problem is asymmetric: testing platforms need to *initiate* requests, b
 
 **Server.** The relay server is the testing platform's responsibility.
 
-**Security boundary.** The relay does not give the testing platform access to your network. Traffic terminates at the adapter — a small process you control that exposes only a single OpenAI-compatible endpoint. Nothing else is forwarded.
+**Security boundary.** The relay does not give the testing platform access to your network. Traffic terminates at the adapter — a small process you control that exposes only OpenAI-compatible endpoints. Nothing else is forwarded.
 
 ## Quickstart
 
@@ -67,9 +67,9 @@ This starts the adapter locally, connects to the relay, and begins forwarding re
 
 ## Adapters
 
-An adapter is a thin translation layer that sits between `spectral-bridge` and your AI system. It serves a single endpoint — `POST /v1/chat/completions` — using standard OpenAI-compatible request and response shapes.
+An adapter is a thin translation layer that sits between `spectral-bridge` and your AI system. It serves standard OpenAI-compatible endpoints — `POST /v1/chat/completions` (Chat Completions API) and/or `POST /v1/responses` (Responses API) — using standard OpenAI request and response shapes. An adapter can implement either or both; the relay client forwards each request to the endpoint it names.
 
-Adapters can be written in any language. Any process, container, or script that serves that endpoint qualifies.
+Adapters can be written in any language. Any process, container, or script that serves one of those endpoints qualifies.
 
 The built-in [`pass-through`](https://github.com/Principled-Intelligence/spectral-bridge/blob/main/adapters/pass-through/) adapter proxies to an existing OpenAI-compatible endpoint and covers most cases. If your AI system has a different shape, writing a custom adapter takes minimal effort — one HTTP endpoint, one JSON schema. See the [adapter documentation](https://spectral.principled.app/docs/spectral-bridge/adapters/custom) for details.
 
@@ -77,7 +77,7 @@ The built-in [`pass-through`](https://github.com/Principled-Intelligence/spectra
 
 `spectral-bridge` is built on an open protocol so that any testing platform can integrate relay support. The protocol has three parts:
 
-1. **Adapter contract** — any process serving `POST /v1/chat/completions` qualifies. Only the chatbot's text response crosses the network boundary; no raw traffic from the internal host is forwarded.
+1. **Adapter contract** — any process serving `POST /v1/chat/completions` and/or `POST /v1/responses` qualifies. Only the chatbot's text response crosses the network boundary; no raw traffic from the internal host is forwarded.
 
 2. **Relay client** — connects outbound to `wss://<relay-host>/connect` with bearer auth. The server pushes request frames; the client dispatches them to the adapter concurrently and returns response frames matched by `request_id`. Reconnects automatically with exponential backoff.
 
