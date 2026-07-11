@@ -29,6 +29,52 @@ async def _echo_asgi(scope, receive, send):
         await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
+async def _read_asgi_body(receive) -> bytes:
+    """Read a full ASGI http.request body (handles chunked more_body)."""
+    chunks = []
+    more_body = True
+    while more_body:
+        message = await receive()
+        chunks.append(message.get("body", b""))
+        more_body = message.get("more_body", False)
+    return b"".join(chunks)
+
+
+async def _responses_echo_asgi(scope, receive, send):
+    """Accepts any POST and echoes `input` into a minimal Responses output[]."""
+    if scope["type"] == "http":
+        raw = await _read_asgi_body(receive)
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        text = payload.get("input", "")
+        if not isinstance(text, str):
+            text = json.dumps(text)
+        body = json.dumps(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }
+                ]
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
 # ── Uvicorn background server helper ─────────────────────────────────────────
 
 class _BackgroundServer(uvicorn.Server):
@@ -69,6 +115,34 @@ def adapter_url(echo_target_url):
     yield url
     server.should_exit = True
     thread.join(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def responses_target_url():
+    server, thread, url = _start_background_server(_responses_echo_asgi)
+    yield url
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+@pytest.fixture
+def responses_adapter_url(adapter_url, responses_target_url):
+    """
+    The already-running pass-through adapter (`adapter_url`), temporarily
+    repointed at the fake Responses target for the duration of one test.
+
+    The consolidated adapter is a single instance backed by one module-level
+    `TARGET_URL`, serving both `/v1/chat/completions` and `/v1/responses` (see
+    PROTOCOL.md / the responses-api-bridge design doc). Spinning up a *second*
+    uvicorn server around the same shared `app` singleton would clobber the
+    `adapter_url` fixture's `app.state.http_client` on startup/shutdown, so
+    tests instead reuse the one running instance and swap its target.
+    """
+    import spectral_bridge_passthrough.app as adapter_mod
+    original_target = adapter_mod.TARGET_URL
+    adapter_mod.TARGET_URL = responses_target_url
+    yield adapter_url
+    adapter_mod.TARGET_URL = original_target
 
 
 # ── Per-test ASGI server factory ──────────────────────────────────────────────

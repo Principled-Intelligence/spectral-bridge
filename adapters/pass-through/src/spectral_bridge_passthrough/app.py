@@ -1,7 +1,8 @@
 """Pass-through adapter.
 
-Forwards OpenAI-compatible chat completion requests to a local endpoint.
-Use when the target already exposes /v1/chat/completions.
+Forwards OpenAI-compatible requests (Chat Completions and/or Responses) to a
+local endpoint. Use when the target already exposes /v1/chat/completions
+and/or /v1/responses.
 """
 
 from __future__ import annotations
@@ -44,6 +45,13 @@ class ChatCompletionRequest(BaseModel):
     model: str | None = None
 
 
+class ResponsesRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    input: str | list = ""
+    model: str | None = None
+
+
 def _forward_headers(request: Request) -> dict[str, str]:
     return {
         name: value
@@ -78,9 +86,8 @@ async def health():
     return {"status": "ok", "target": TARGET_URL}
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionRequest, request: Request):
-    url = f"{TARGET_URL}/v1/chat/completions"
+async def _forward(path: str, body: BaseModel, request: Request) -> JSONResponse:
+    url = f"{TARGET_URL}{path}"
     headers = _forward_headers(request)
     client: httpx.AsyncClient = request.app.state.http_client
 
@@ -103,3 +110,13 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         log.warning("target returned %s: %s", resp.status_code, content)
 
     return JSONResponse(status_code=resp.status_code, content=content)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(body: ChatCompletionRequest, request: Request):
+    return await _forward("/v1/chat/completions", body, request)
+
+
+@app.post("/v1/responses")
+async def responses(body: ResponsesRequest, request: Request):
+    return await _forward("/v1/responses", body, request)

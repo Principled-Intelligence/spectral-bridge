@@ -209,7 +209,8 @@ class RelayClient:
     ) -> None:
         body = payload.get("body", {})
         adapter_headers = _headers_for_adapter(payload.get("headers"))
-        url = f"{self.adapter_url}{ADAPTER_CHAT_PATH}"
+        path = payload.get("path", ADAPTER_CHAT_PATH)
+        url = f"{self.adapter_url}{path}"
 
         try:
             resp = await self._http.post(url, json=body, headers=adapter_headers)
