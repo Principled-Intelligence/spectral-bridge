@@ -93,6 +93,42 @@ def test_validate_http_rejected():
         RelayClient("http://relay.example.com/connect", "key", "http://localhost:8000")
 
 
+def test_validate_adapter_loopback_hosts_accepted():
+    # Every loopback form the client must accept without raising.
+    for adapter in (
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://[::1]:8000",
+        "http://127.0.0.2:8000",  # all of 127.0.0.0/8 is loopback
+        "https://127.0.0.1:8000",
+    ):
+        RelayClient("wss://relay.example.com/connect", "key", adapter)
+
+
+def test_validate_adapter_non_loopback_rejected():
+    with pytest.raises(ValueError, match="loopback"):
+        RelayClient(
+            "wss://relay.example.com/connect", "key", "http://evil.example.com"
+        )
+
+
+def test_validate_adapter_non_http_scheme_rejected():
+    with pytest.raises(ValueError, match="http"):
+        RelayClient(
+            "wss://relay.example.com/connect", "key", "ftp://127.0.0.1:8000"
+        )
+
+
+def test_validate_adapter_non_loopback_allowed_with_insecure_flag():
+    # Should not raise: explicit opt-out.
+    RelayClient(
+        "wss://relay.example.com/connect",
+        "key",
+        "http://evil.example.com",
+        insecure_adapter=True,
+    )
+
+
 def test_validate_max_bytes_zero_raises():
     with pytest.raises(ValueError, match="max_ws_message_bytes"):
         RelayClient(
@@ -375,6 +411,68 @@ async def test_absent_frame_path_defaults_to_chat(make_relay_server, make_asgi_s
     response = await _drive_one_frame(make_relay_server, target_url, frame)
     assert response["payload"]["status"] == 200
     assert recorder == ["/v1/chat/completions"]
+
+
+async def test_frame_path_userinfo_injection_rejected(
+    make_relay_server, make_asgi_server
+):
+    """A path that would smuggle a host via userinfo is rejected with 404 and
+    never reaches the adapter (no off-loopback request is made)."""
+    recorder: list = []
+    target_url = make_asgi_server(_path_recording_app(recorder))
+    frame = {
+        "type": "request",
+        "request_id": "evil-1",
+        "payload": {
+            "method": "POST",
+            "path": "@evil.example.com/v1/chat/completions",
+            "headers": {},
+            "body": {"input": "hi"},
+        },
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["status"] == 404
+    assert response["payload"]["body"]["error"]["message"] == "unknown adapter path"
+    assert recorder == []
+
+
+async def test_frame_path_traversal_rejected(make_relay_server, make_asgi_server):
+    """A traversal path is rejected with 404 and never reaches the adapter."""
+    recorder: list = []
+    target_url = make_asgi_server(_path_recording_app(recorder))
+    frame = {
+        "type": "request",
+        "request_id": "trav-1",
+        "payload": {
+            "method": "POST",
+            "path": "/../..",
+            "headers": {},
+            "body": {},
+        },
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["status"] == 404
+    assert recorder == []
+
+
+async def test_frame_path_non_string_rejected(make_relay_server, make_asgi_server):
+    """A non-string path (JSON array/object) is rejected with 404 rather than
+    crashing the handler and leaving the request unanswered."""
+    recorder: list = []
+    target_url = make_asgi_server(_path_recording_app(recorder))
+    frame = {
+        "type": "request",
+        "request_id": "nonstr-1",
+        "payload": {
+            "method": "POST",
+            "path": [],
+            "headers": {},
+            "body": {},
+        },
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["status"] == 404
+    assert recorder == []
 
 
 # ── Resilience ────────────────────────────────────────────────────────────────

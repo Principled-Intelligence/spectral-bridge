@@ -8,6 +8,7 @@ the adapter's responses.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
@@ -34,6 +35,8 @@ STABLE_CONNECTION_THRESHOLD = 60
 
 
 ADAPTER_CHAT_PATH = "/v1/chat/completions"
+ADAPTER_RESPONSES_PATH = "/v1/responses"
+ADAPTER_ALLOWED_PATHS = frozenset({ADAPTER_CHAT_PATH, ADAPTER_RESPONSES_PATH})
 
 DEFAULT_MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
 
@@ -80,6 +83,7 @@ class RelayClient:
         adapter_url: str,
         *,
         insecure_relay: bool = False,
+        insecure_adapter: bool = False,
         max_ws_message_bytes: int = DEFAULT_MAX_WS_MESSAGE_BYTES,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ) -> None:
@@ -95,6 +99,7 @@ class RelayClient:
         self._http: httpx.AsyncClient | None = None
         self._tasks: set[asyncio.Task] = set()
         self._validate_relay_url(insecure_relay)
+        self._validate_adapter_url(insecure_adapter)
 
     def _validate_relay_url(self, insecure_relay: bool) -> None:
         parsed = urlparse(self.relay_url)
@@ -110,6 +115,31 @@ class RelayClient:
             )
         raise ValueError("relay url must use wss:// or ws:// websocket scheme")
 
+    def _validate_adapter_url(self, insecure_adapter: bool) -> None:
+        parsed = urlparse(self.adapter_url)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            raise ValueError("adapter url must use http:// or https://")
+        host = parsed.hostname or ""
+        if self._is_loopback_host(host):
+            return
+        if insecure_adapter:
+            logger.warning("non-loopback adapter url, forwarding beyond localhost")
+            return
+        raise ValueError(
+            "adapter url must be loopback (localhost/127.0.0.1/::1) "
+            "unless --insecure-adapter is set"
+        )
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        if host.lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
     async def _cancel_inflight_handlers(self) -> None:
         if not self._tasks:
             return
@@ -121,7 +151,8 @@ class RelayClient:
     async def run(self) -> None:
         attempt = 0
         self._http = httpx.AsyncClient(
-            timeout=httpx.Timeout(self._request_timeout, connect=_CONNECT_TIMEOUT)
+            timeout=httpx.Timeout(self._request_timeout, connect=_CONNECT_TIMEOUT),
+            follow_redirects=False,
         )
         try:
             while True:
@@ -210,6 +241,22 @@ class RelayClient:
         body = payload.get("body", {})
         adapter_headers = _headers_for_adapter(payload.get("headers"))
         path = payload.get("path", ADAPTER_CHAT_PATH)
+        if not isinstance(path, str) or path not in ADAPTER_ALLOWED_PATHS:
+            logger.warning("rejected unknown adapter path %r", path)
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "response",
+                        "request_id": request_id,
+                        "payload": {
+                            "status": 404,
+                            "headers": {"content-type": "application/json"},
+                            "body": {"error": {"message": "unknown adapter path"}},
+                        },
+                    }
+                )
+            )
+            return
         url = f"{self.adapter_url}{path}"
 
         try:

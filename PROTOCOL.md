@@ -138,6 +138,8 @@ A **conforming** relay client must use TLS (`wss://`). Plain `ws://` is not perm
 
 Reference implementations may support plain `ws://` when the operator explicitly opts in (for example a `--insecure-relay` flag). That mode is for local development and debugging only; it is not conforming and must not be used where the relay traffic could leave a trusted network.
 
+Similarly, reference clients reach the adapter over loopback only: they reject an `adapter_url` whose host is not a loopback address (`localhost`, `127.0.0.0/8`, or `::1`). An explicit opt-out (for example an `--insecure-adapter` flag) may allow a non-loopback adapter for development, mirroring `--insecure-relay`; like that mode it is not intended for deployments where the adapter traffic could leave a trusted network.
+
 On successful authentication, the server sends a confirmation frame before any request frames:
 
 ```json
@@ -169,7 +171,7 @@ All WebSocket frames carry UTF-8 encoded JSON. Two message types are defined.
 
 `request_id` is assigned by the relay server. It is opaque to the client — treat it as a correlation token and echo it back unchanged in the response.
 
-`path` names the adapter endpoint the request targets (e.g. `/v1/chat/completions` or `/v1/responses`). The relay client forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions` for backward compatibility.
+`path` names the adapter endpoint the request targets. The client accepts only the protocol-defined endpoints — `/v1/chat/completions` and `/v1/responses` — matched exactly, and forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions` for backward compatibility. Any other `path` value is rejected: the client sends a `404` error response frame and makes no request to the adapter. This prevents a relay-supplied path from redirecting the request off the configured loopback adapter.
 
 #### Outbound: Response frame (client → server)
 

@@ -121,6 +121,12 @@ def cli() -> None:
     help="Allow ws:// to the relay (not spec conforming; development only)",
 )
 @click.option(
+    "--insecure-adapter",
+    is_flag=True,
+    help="Allow a non-loopback adapter URL (development only; the adapter is "
+    "normally reached over localhost)",
+)
+@click.option(
     "--max-ws-message-bytes",
     type=click.IntRange(min=1),
     default=DEFAULT_MAX_WS_MESSAGE_BYTES,
@@ -139,6 +145,7 @@ def start_relay(
     relay_url: str,
     adapter_url: str,
     insecure_relay: bool,
+    insecure_adapter: bool,
     max_ws_message_bytes: int,
     request_timeout: float,
 ) -> None:
@@ -150,6 +157,7 @@ def start_relay(
             api_key,
             adapter_url,
             insecure_relay=insecure_relay,
+            insecure_adapter=insecure_adapter,
             max_ws_message_bytes=max_ws_message_bytes,
             request_timeout=request_timeout,
         )
