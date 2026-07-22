@@ -60,10 +60,20 @@ If your AI system already exposes an OpenAI-compatible HTTP endpoint, the built-
 spectral-bridge start \
   --relay-url  wss://relay.example.com/connect \
   --adapter    pass-through \
-  --target     http://internal-host:8080
+  --target     <your-ai-system-url>
 ```
 
 This starts the adapter locally, connects to the relay, and begins forwarding requests.
+
+The same setup is also available as a [container image](https://github.com/Principled-Intelligence/spectral-bridge/pkgs/container/spectral-bridge) — no ports to publish, since all connections are outbound:
+
+```bash
+docker run -d --restart always --read-only --cap-drop ALL \
+  -e SPECTRAL_BRIDGE_API_KEY=<your-api-key> \
+  -e RELAY_URL=wss://relay.example.com/connect \
+  -e TARGET_URL=<your-ai-system-url> \
+  ghcr.io/principled-intelligence/spectral-bridge:latest
+```
 
 ## Adapters
 

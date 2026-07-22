@@ -1,0 +1,15 @@
+# Allowlist: exclude everything, then re-include only what the image build needs.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!NOTICE
+!src
+!adapters/pass-through
+!docker
+
+# Re-excluded from the allowed trees above.
+adapters/pass-through/dist
+adapters/pass-through/tests
+**/__pycache__
