@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "spectral-bridge"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Open protocol for testing network-isolated AI systems"
 readme = "README.md"
 license = "Apache-2.0"
@@ -37,6 +37,9 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests", "adapters/pass-through/tests"]
 addopts = "--import-mode=importlib"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/spectral_bridge"]

@@ -418,7 +418,6 @@ wheels = [
 
 [[package]]
 name = "spectral-bridge"
-version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -460,7 +459,6 @@ dev = [
 
 [[package]]
 name = "spectral-bridge-adapter-pass-through"
-version = "0.2.0"
 source = { editable = "adapters/pass-through" }
 dependencies = [
     { name = "fastapi" },

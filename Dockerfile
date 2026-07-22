@@ -9,6 +9,12 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
+# Versions come from git tags (hatch-vcs), but .git is excluded from the build
+# context — the release workflow passes the version in; local builds get a
+# dev placeholder.
+ARG BRIDGE_VERSION=0.0.0.dev0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${BRIDGE_VERSION}
+
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./

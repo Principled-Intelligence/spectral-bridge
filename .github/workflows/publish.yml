@@ -1,9 +1,12 @@
 name: "Publish"
 
+# `published` (not `created`): a draft release that is published later never
+# fires `created`, which would skip the PyPI upload while other release
+# workflows still run.
 on:
   release:
     types:
-      - created
+      - published
 
 jobs:
   publish:
@@ -16,6 +19,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives the package version from git tags
+          fetch-depth: 0
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - name: Install Python 3.13
@@ -24,9 +30,10 @@ jobs:
       - name: Build spectral-bridge
         run: uv build
       - name: Publish spectral-bridge
-        run: uv publish
+        # --check-url skips files already on PyPI so workflow re-runs stay green
+        run: uv publish --check-url https://pypi.org/simple/
 
       - name: Build spectral-bridge-adapter-pass-through
         run: uv build --directory adapters/pass-through
       - name: Publish spectral-bridge-adapter-pass-through
-        run: uv publish --directory adapters/pass-through
+        run: uv publish --directory adapters/pass-through --check-url https://pypi.org/simple/
