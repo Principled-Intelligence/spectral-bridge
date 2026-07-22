@@ -92,6 +92,19 @@ async def test_target_unreachable_returns_502(adapter_client, mock_target):
     assert "error" in response.json()
 
 
+async def test_target_unreachable_does_not_leak_exception_detail(
+    adapter_client, mock_target
+):
+    mock_target.post.side_effect = httpx.ConnectError("connection refused")
+
+    response = await adapter_client.post(
+        "/v1/chat/completions",
+        json={"model": "test", "messages": []},
+    )
+
+    assert "connection refused" not in response.text
+
+
 async def test_target_timeout_returns_502(adapter_client, mock_target):
     mock_target.post.side_effect = httpx.TimeoutException("timed out")
 

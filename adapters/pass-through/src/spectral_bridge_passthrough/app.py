@@ -96,9 +96,10 @@ async def _forward(path: str, body: BaseModel, request: Request) -> JSONResponse
             url, json=body.model_dump(exclude_unset=True), headers=headers
         )
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        log.warning("target unreachable: %s", exc)
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": f"target unreachable: {exc}"}},
+            content={"error": {"message": "target unreachable"}},
         )
 
     try:
