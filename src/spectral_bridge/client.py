@@ -41,8 +41,9 @@ ADAPTER_ALLOWED_PATHS = frozenset({ADAPTER_CHAT_PATH, ADAPTER_RESPONSES_PATH})
 DEFAULT_MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
 
 # Max time to wait for the adapter to return a completion. Long completions are
-# real, so this is generous; keep it >= the relay server's RELAY_TIMEOUT_SECONDS
-# so the server is the authority on giving up rather than the client.
+# real, so this is generous; the default is matched to the Spectral relay's
+# server-side timeout. On another platform keep it >= that relay's timeout so
+# the server is the authority on giving up rather than the client.
 DEFAULT_REQUEST_TIMEOUT = 600.0
 _CONNECT_TIMEOUT = 10.0
 

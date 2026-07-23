@@ -48,7 +48,7 @@ pip install "spectral-bridge[pass-through]"
 
 ### Connect
 
-Your testing platform will provide a relay URL and an API key. Set the key as an environment variable (this keeps it out of shell history):
+Set your Spectral API key as an environment variable (this keeps it out of shell history):
 
 ```bash
 export SPECTRAL_BRIDGE_API_KEY=<your-api-key>
@@ -58,22 +58,22 @@ If your AI system already exposes an OpenAI-compatible HTTP endpoint, the built-
 
 ```bash
 spectral-bridge start \
-  --relay-url  wss://relay.example.com/connect \
-  --adapter    pass-through \
-  --target     <your-ai-system-url>
+  --adapter pass-through \
+  --target  <your-ai-system-url>
 ```
 
-This starts the adapter locally, connects to the relay, and begins forwarding requests.
+This starts the adapter locally, connects to the [Spectral](https://spectral.principled.app) relay, and begins forwarding requests.
 
 The same setup is also available as a [container image](https://github.com/Principled-Intelligence/spectral-bridge/pkgs/container/spectral-bridge) — no ports to publish, since all connections are outbound:
 
 ```bash
 docker run -d --restart always --read-only --cap-drop ALL \
   -e SPECTRAL_BRIDGE_API_KEY=<your-api-key> \
-  -e RELAY_URL=wss://relay.example.com/connect \
   -e TARGET_URL=<your-ai-system-url> \
   ghcr.io/principled-intelligence/spectral-bridge:latest
 ```
+
+**Using another platform?** `spectral-bridge` works with any relay server that implements the [open protocol](https://github.com/Principled-Intelligence/spectral-bridge/blob/main/PROTOCOL.md). Point it at your platform's relay with `--relay-url wss://relay.example.com/connect` (or the `SPECTRAL_BRIDGE_RELAY_URL` environment variable; `RELAY_URL` in Docker).
 
 ## Adapters
 

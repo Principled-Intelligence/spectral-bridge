@@ -25,6 +25,7 @@ from spectral_bridge.client import (
     DEFAULT_REQUEST_TIMEOUT,
     RelayClient,
 )
+from spectral_bridge.cli.defaults import SPECTRAL_RELAY_URL
 
 logger = logging.getLogger("spectral_bridge.cli")
 
@@ -107,8 +108,11 @@ def cli() -> None:
 @cli.command("start-relay")
 @click.option(
     "--relay-url",
-    required=True,
-    help="Relay server WebSocket URL (e.g. wss://relay.example.com/connect)",
+    envvar="SPECTRAL_BRIDGE_RELAY_URL",
+    default=SPECTRAL_RELAY_URL,
+    show_default=True,
+    help="Relay server WebSocket URL; defaults to the Spectral relay "
+    "(override to use another platform, env: SPECTRAL_BRIDGE_RELAY_URL)",
 )
 @click.option(
     "--adapter-url",
@@ -139,7 +143,8 @@ def cli() -> None:
     default=DEFAULT_REQUEST_TIMEOUT,
     show_default=True,
     help="Max seconds to wait for the adapter to return a completion "
-    "(keep >= the relay server's RELAY_TIMEOUT_SECONDS)",
+    "(default is matched to the Spectral relay; on another platform keep "
+    "it >= that relay's server-side timeout)",
 )
 def start_relay(
     relay_url: str,
@@ -150,6 +155,7 @@ def start_relay(
     request_timeout: float,
 ) -> None:
     """Connect the relay client to an already-running adapter."""
+    relay_url = relay_url.strip()
     api_key = _relay_api_key_from_env()
     try:
         client = RelayClient(
@@ -172,8 +178,11 @@ def start_relay(
 @cli.command()
 @click.option(
     "--relay-url",
-    required=True,
-    help="Relay server WebSocket URL (e.g. wss://relay.example.com/connect)",
+    envvar="SPECTRAL_BRIDGE_RELAY_URL",
+    default=SPECTRAL_RELAY_URL,
+    show_default=True,
+    help="Relay server WebSocket URL; defaults to the Spectral relay "
+    "(override to use another platform, env: SPECTRAL_BRIDGE_RELAY_URL)",
 )
 @click.option(
     "--adapter",
@@ -203,7 +212,8 @@ def start_relay(
     default=DEFAULT_REQUEST_TIMEOUT,
     show_default=True,
     help="Max seconds to wait for the adapter to return a completion "
-    "(keep >= the relay server's RELAY_TIMEOUT_SECONDS)",
+    "(default is matched to the Spectral relay; on another platform keep "
+    "it >= that relay's server-side timeout)",
 )
 def start(
     relay_url: str,
@@ -215,6 +225,7 @@ def start(
     request_timeout: float,
 ) -> None:
     """Start a built-in adapter and connect the relay client."""
+    relay_url = relay_url.strip()
     api_key = _relay_api_key_from_env()
     logger.info(
         "starting %s adapter, forwarding traffic from port %d to target %s",
