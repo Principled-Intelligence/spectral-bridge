@@ -176,10 +176,10 @@ class RelayClient:
                         return
                     reason = str(exc)
                 except InvalidStatus as exc:
-                    if exc.response.status_code == 401:
+                    if exc.response.status_code in (401, 403):
                         logger.error("authentication failed")
                         return
-                    raise
+                    reason = f"handshake rejected with http {exc.response.status_code}"
                 except (OSError, WebSocketException) as exc:
                     reason = str(exc)
 

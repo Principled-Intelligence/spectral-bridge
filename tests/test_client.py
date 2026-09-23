@@ -250,13 +250,13 @@ async def test_auth_failure_4001_stops_client(make_relay_server, adapter_url):
     await asyncio.wait_for(_client(url, adapter_url).run(), timeout=5)
 
 
-async def test_auth_failure_401_stops_client(adapter_url):
-    """HTTP 401 during WebSocket upgrade → run() returns without retrying."""
+async def _serve_http_status(status_line: bytes):
+    """A bare TCP server that answers every WebSocket upgrade with ``status_line``."""
 
-    async def serve_401(reader, writer):
+    async def serve(reader, writer):
         await reader.read(4096)
         writer.write(
-            b"HTTP/1.1 401 Unauthorized\r\n"
+            b"HTTP/1.1 " + status_line + b"\r\n"
             b"Content-Length: 0\r\n"
             b"Connection: close\r\n\r\n"
         )
@@ -264,13 +264,49 @@ async def test_auth_failure_401_stops_client(adapter_url):
         writer.close()
         await writer.wait_closed()
 
-    server = await asyncio.start_server(serve_401, "127.0.0.1", 0)
+    return await asyncio.start_server(serve, "127.0.0.1", 0)
+
+
+@pytest.mark.parametrize("status_line", [b"401 Unauthorized", b"403 Forbidden"])
+async def test_auth_failure_http_status_stops_client(adapter_url, status_line):
+    """HTTP 401/403 during WebSocket upgrade → run() returns without retrying.
+
+    403 is what an ASGI relay sends when it closes the socket before accept().
+    """
+    server = await _serve_http_status(status_line)
     url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
     try:
         await asyncio.wait_for(_client(url, adapter_url).run(), timeout=5)
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_transient_handshake_status_reconnects(make_relay_server, adapter_url):
+    """A non-auth handshake rejection (e.g. 503 while the relay is being
+    provisioned) is transient: the client keeps retrying instead of crashing."""
+    connected = asyncio.Event()
+
+    async def relay(ws):
+        connected.set()
+        await ws.recv()
+
+    relay_url = await make_relay_server(relay)
+    unavailable = await _serve_http_status(b"503 Service Unavailable")
+    unavailable_port = unavailable.sockets[0].getsockname()[1]
+    client = _client(f"ws://127.0.0.1:{unavailable_port}", adapter_url)
+
+    try:
+        async with running_client(client) as task:
+            # first attempt hits the 503; the client must survive it and retry,
+            # this time against the healthy relay
+            await asyncio.sleep(0.2)
+            assert not task.done()
+            client.relay_url = relay_url
+            await asyncio.wait_for(connected.wait(), timeout=10)
+    finally:
+        unavailable.close()
+        await unavailable.wait_closed()
 
 
 async def test_unexpected_first_frame_reconnects(make_relay_server, adapter_url):
