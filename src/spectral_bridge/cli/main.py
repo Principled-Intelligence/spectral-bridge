@@ -12,13 +12,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
+from typing import IO
 
 import click
 import httpx
 from rich.logging import RichHandler
+from rich.text import Text
 
 from spectral_bridge.client import (
     DEFAULT_MAX_WS_MESSAGE_BYTES,
@@ -28,6 +32,24 @@ from spectral_bridge.client import (
 from spectral_bridge.cli.defaults import SPECTRAL_RELAY_URL
 
 logger = logging.getLogger("spectral_bridge.cli")
+adapter_logger = logging.getLogger("spectral_bridge.adapter")
+
+# uvicorn's default log format: "WARNING:  message"
+_UVICORN_LEVEL_PREFIX = re.compile(r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL):\s+")
+
+
+class _SourceRichHandler(RichHandler):
+    """Prefix each log line with where it comes from, docker-compose style."""
+
+    def render_message(self, record: logging.LogRecord, message: str) -> Text:
+        if record.name == adapter_logger.name:
+            source, style = "adapter", "magenta"
+        else:
+            source, style = "bridge", "cyan"
+        return Text.assemble(
+            (f"{source:<7} | ", style), super().render_message(record, message)
+        )
+
 
 API_KEY_ENV = "SPECTRAL_BRIDGE_API_KEY"
 
@@ -53,9 +75,8 @@ def _wait_for_adapter(url: str, proc: subprocess.Popen, timeout: float = 10.0) -
     while time.monotonic() < deadline:
         ret = proc.poll()
         if ret is not None:
-            stderr = proc.stderr.read() if proc.stderr else ""
             raise click.ClickException(
-                f"adapter process exited with code {ret}\n{stderr}"
+                f"adapter process exited with code {ret}, see its logs above"
             )
         try:
             r = httpx.get(f"{url}/health", timeout=2)
@@ -88,10 +109,32 @@ def _spawn_adapter(adapter: str, target: str, port: int) -> subprocess.Popen:
             "warning",
         ],
         env=env,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
     )
+    # the pipe must be drained for the adapter's whole life: once full (~64 KiB)
+    # the adapter blocks on its next log write
+    threading.Thread(
+        target=_relog_adapter_output, args=(proc.stdout,), daemon=True
+    ).start()
     return proc
+
+
+def _relog_adapter_output(stream: IO[str]) -> None:
+    """Re-log each line the adapter prints, under the adapter's logger."""
+    # unprefixed lines (e.g. traceback frames) keep the previous line's level
+    level = logging.WARNING
+    for line in stream:
+        line = line.rstrip()
+        if not line:
+            continue
+        match = _UVICORN_LEVEL_PREFIX.match(line)
+        if match:
+            level = getattr(logging, match[1])
+            line = line[match.end() :]
+        adapter_logger.log(level, "%s", line)
 
 
 @click.group()
@@ -101,7 +144,7 @@ def cli() -> None:
         level=logging.INFO,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(show_path=False, markup=False)],
+        handlers=[_SourceRichHandler(show_path=False, markup=False)],
     )
 
 
