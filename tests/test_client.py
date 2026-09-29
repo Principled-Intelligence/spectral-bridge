@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 
 import pytest
@@ -565,6 +566,117 @@ async def test_abnormal_closure_reconnects(make_relay_server, adapter_url):
     async with running_client(_client(url, adapter_url)):
         await asyncio.wait_for(reconnected.wait(), timeout=10)
     assert connection_count == 2
+
+
+async def test_adapter_error_is_forwarded_and_logged(
+    roundtrip, make_asgi_server, caplog
+):
+    """An adapter error reaches the relay unchanged, and is logged here, truncated."""
+    error = {"error": {"message": "x" * 5000}}
+
+    async def failing_app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        body = json.dumps(error).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 500,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    url = make_asgi_server(failing_app)
+    with caplog.at_level("WARNING", logger="spectral_bridge.client"):
+        response = (await roundtrip(url, ["req-1"]))["req-1"]
+
+    assert response["payload"]["status"] == 500
+    assert response["payload"]["body"] == error
+    [message] = [
+        r.getMessage() for r in caplog.records if "adapter returned" in r.getMessage()
+    ]
+    assert message.startswith("adapter returned 500 for req-1: ")
+    assert "chars truncated" in message
+
+
+# ── Responses across reconnects ───────────────────────────────────────────────
+
+
+async def _response_after_reconnect(
+    make_relay_server, make_asgi_server, adapter_delay: float
+) -> dict:
+    """
+    Send a request on a first connection, then sever it (no close frame, as
+    Cloud Run does at its request timeout) while the adapter is still working.
+    Return the response frame the client sends on its second connection.
+    """
+    slow_url = make_asgi_server(_slow_completion_app(adapter_delay))
+    connection_count = 0
+    received: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    async def relay(ws):
+        nonlocal connection_count
+        connection_count += 1
+        await ws.send(json.dumps({"type": "connected"}))
+        if connection_count == 1:
+            await ws.send(json.dumps(request_frame("req-1")))
+            ws.transport.abort()
+        else:
+            received.set_result(json.loads(await ws.recv()))
+            await ws.recv()
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, slow_url)):
+        return await asyncio.wait_for(received, timeout=10)
+
+
+async def test_response_held_while_disconnected_is_sent_on_reconnect(
+    make_relay_server, make_asgi_server
+):
+    """The adapter answers during the reconnect backoff (~1s): the response is
+    held, then sent on the new connection."""
+    frame = await _response_after_reconnect(
+        make_relay_server, make_asgi_server, adapter_delay=0.3
+    )
+    assert frame["request_id"] == "req-1"
+    assert frame["payload"]["status"] == 200
+
+
+async def test_response_after_reconnect_goes_to_the_new_connection(
+    make_relay_server, make_asgi_server
+):
+    """The adapter answers once the client has reconnected: the response goes on
+    the new connection, not the one the request came in on."""
+    frame = await _response_after_reconnect(
+        make_relay_server, make_asgi_server, adapter_delay=2.0
+    )
+    assert frame["request_id"] == "req-1"
+    assert frame["payload"]["status"] == 200
+
+
+async def test_held_response_past_its_deadline_is_dropped():
+    """A response the relay has already given up on isn't sent on reconnect."""
+
+    class _Ws:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+    client = _client("ws://relay.test/connect", "http://localhost:1")
+    now = time.monotonic()
+    expired = {"type": "response", "request_id": "old", "payload": {"status": 200}}
+    fresh = {"type": "response", "request_id": "new", "payload": {"status": 200}}
+    client._outbox = [(now - 1, expired), (now + 60, fresh)]
+    client._ws = ws = _Ws()
+
+    await client._flush_outbox()
+
+    assert [frame["request_id"] for frame in ws.sent] == ["new"]
+    assert client._outbox == []
 
 
 # ── Reconnect backoff ─────────────────────────────────────────────────────────

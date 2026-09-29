@@ -19,6 +19,7 @@ import httpx
 import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import (
+    ConnectionClosed,
     ConnectionClosedError,
     InvalidStatus,
     ProtocolError,
@@ -39,6 +40,9 @@ ADAPTER_RESPONSES_PATH = "/v1/responses"
 ADAPTER_ALLOWED_PATHS = frozenset({ADAPTER_CHAT_PATH, ADAPTER_RESPONSES_PATH})
 
 DEFAULT_MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
+
+# logged bodies are truncated: they are unbounded and may echo request content
+MAX_LOG_BODY_CHARS = 1024
 
 # Max time to wait for the adapter to return a completion. Long completions are
 # real, so this is generous; the default is matched to the Spectral relay's
@@ -99,6 +103,11 @@ class RelayClient:
         self._request_timeout = request_timeout
         self._http: httpx.AsyncClient | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._ws: ClientConnection | None = None
+        # responses that couldn't be sent, with the deadline past which the relay
+        # has given up on them: sent once reconnected, as the relay keeps
+        # waiting for them across connections
+        self._outbox: list[tuple[float, dict[str, Any]]] = []
         self._validate_relay_url(insecure_relay)
         self._validate_adapter_url(insecure_adapter)
 
@@ -216,9 +225,12 @@ class RelayClient:
                 raise ProtocolError(f"unexpected first frame: {msg}")
             logger.info("connected to relay")
 
-            # run listener; keepalive is handled by websockets library's
-            # built-in ping_interval / ping_timeout
-            await self._listen(ws)
+            self._ws = ws
+            try:
+                await self._flush_outbox()
+                await self._listen(ws)
+            finally:
+                self._ws = None
 
     async def _listen(self, ws: ClientConnection) -> None:
         async for raw in ws:
@@ -226,88 +238,103 @@ class RelayClient:
             msg_type = data.get("type")
             if msg_type == "request":
                 task = asyncio.create_task(
-                    self._handle_request(ws, data["request_id"], data["payload"])
+                    self._handle_request(data["request_id"], data["payload"])
                 )
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
             else:
                 logger.warning("unknown frame type=%s", msg_type)
 
-    async def _handle_request(
-        self,
-        ws: ClientConnection,
-        request_id: str,
-        payload: dict[str, Any],
-    ) -> None:
+    async def _send_or_hold_response(
+        self, request_id: str, payload: dict[str, Any], deadline: float
+    ) -> bool:
+        frame = {"type": "response", "request_id": request_id, "payload": payload}
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.send(json.dumps(frame))
+                return True
+            except ConnectionClosed:
+                pass
+
+        # response frame couldn't be sent, keep it for retry
+        logger.info("relay disconnected, holding response for %s", request_id)
+        self._outbox.append((deadline, frame))
+        return False
+
+    async def _flush_outbox(self) -> None:
+        """Send the responses held while disconnected, over the current connection."""
+        outbox, self._outbox = self._outbox, []
+        sent = 0
+        for deadline, frame in outbox:
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "dropped response for %s, relay reconnected too late",
+                    frame["request_id"],
+                )
+                continue
+            sent += await self._send_or_hold_response(
+                frame["request_id"], frame["payload"], deadline
+            )
+        if sent:
+            logger.info("sent %d held responses", sent)
+
+    async def _handle_request(self, request_id: str, payload: dict[str, Any]) -> None:
+        # past this, the relay stops waiting for the response
+        deadline = time.monotonic() + self._request_timeout
+        response = await self._call_adapter(request_id, payload)
+        await self._send_or_hold_response(request_id, response, deadline)
+
+    async def _call_adapter(
+        self, request_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         body = payload.get("body", {})
         adapter_headers = _headers_for_adapter(payload.get("headers"))
         path = payload.get("path", ADAPTER_CHAT_PATH)
         if not isinstance(path, str) or path not in ADAPTER_ALLOWED_PATHS:
             logger.warning("rejected unknown adapter path %r", path)
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "response",
-                        "request_id": request_id,
-                        "payload": {
-                            "status": 404,
-                            "headers": {"content-type": "application/json"},
-                            "body": {"error": {"message": "unknown adapter path"}},
-                        },
-                    }
-                )
-            )
-            return
+            return _error_payload(404, "unknown adapter path")
         url = f"{self.adapter_url}{path}"
 
         try:
             resp = await self._http.post(url, json=body, headers=adapter_headers)
             response_body = resp.json()
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "response",
-                        "request_id": request_id,
-                        "payload": {
-                            "status": resp.status_code,
-                            "headers": {"content-type": "application/json"},
-                            "body": response_body,
-                        },
-                    }
-                )
-            )
         except (httpx.ConnectError, httpx.TimeoutException) as exc:
             logger.warning("adapter unavailable (%r)", exc)
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "response",
-                        "request_id": request_id,
-                        "payload": {
-                            "status": 503,
-                            "headers": {"content-type": "application/json"},
-                            "body": {"error": {"message": "adapter unavailable"}},
-                        },
-                    }
-                )
-            )
+            return _error_payload(503, "adapter unavailable")
         except Exception:
             logger.exception("error handling request %s", request_id)
-            try:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "response",
-                            "request_id": request_id,
-                            "payload": {
-                                "status": 500,
-                                "headers": {"content-type": "application/json"},
-                                "body": {
-                                    "error": {"message": "internal relay client error"}
-                                },
-                            },
-                        }
-                    )
-                )
-            except Exception:
-                pass
+            return _error_payload(500, "internal relay client error")
+
+        # we forward as is, even if we have an error, but we log here
+        # as well for visibility
+        if resp.status_code >= 400:
+            logger.warning(
+                "adapter returned %d for %s: %s",
+                resp.status_code,
+                request_id,
+                _for_log(response_body),
+            )
+
+        return {
+            "status": resp.status_code,
+            "headers": {"content-type": "application/json"},
+            "body": response_body,
+        }
+
+
+def _for_log(value: object) -> str:
+    """Render a value for a log line, truncated past ``MAX_LOG_BODY_CHARS``."""
+    text = json.dumps(value, default=str)
+    extra = len(text) - MAX_LOG_BODY_CHARS
+    if extra > 0:
+        return f"{text[:MAX_LOG_BODY_CHARS]}... ({extra} chars truncated)"
+    return text
+
+
+def _error_payload(status: int, message: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "headers": {"content-type": "application/json"},
+        "body": {"error": {"message": message}},
+    }
