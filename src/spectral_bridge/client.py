@@ -122,8 +122,12 @@ class RelayClient:
         self._all_acked = asyncio.Event()
         # the shutdown, once requested: new requests are refused while draining
         self._drain_task: asyncio.Task | None = None
+        # set by a second shutdown(): stop without waiting any longer
+        self._stop_now = False
         # set once drained: run() then returns rather than reconnecting
         self._stopped = asyncio.Event()
+        # cuts a reconnect backoff short, when shutting down
+        self._wakeup = asyncio.Event()
         self._validate_relay_url(insecure_relay)
         self._validate_adapter_url(insecure_adapter)
 
@@ -183,6 +187,7 @@ class RelayClient:
         try:
             while True:
                 t0 = time.monotonic()
+                rotated = False
                 try:
                     await self._connect()
                     # clean close (server sent a close frame)
@@ -200,10 +205,6 @@ class RelayClient:
                         )
                         return
                     rotated = exc.rcvd is not None and exc.rcvd.code == 4003
-                    if rotated and not self._stopped.is_set():
-                        logger.info("relay rotated the connection, reconnecting")
-                        attempt = 0
-                        continue
                     sent_1009 = exc.sent is not None and exc.sent.code == 1009
                     rcvd_1009 = exc.rcvd is not None and exc.rcvd.code == 1009
                     if sent_1009 or rcvd_1009:
@@ -238,7 +239,14 @@ class RelayClient:
                 if time.monotonic() - t0 >= STABLE_CONNECTION_THRESHOLD:
                     attempt = 0
                 delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
-                logger.warning("disconnected (%s), reconnecting in %ds", reason, delay)
+                if rotated:
+                    logger.info(
+                        "relay rotated the connection, reconnecting in %ds", delay
+                    )
+                else:
+                    logger.warning(
+                        "disconnected (%s), reconnecting in %ds", reason, delay
+                    )
                 if await self._sleep_unless_stopped(delay):
                     return
                 attempt += 1
@@ -256,8 +264,11 @@ class RelayClient:
         """
         if self._drain_task is None:
             self._drain_task = asyncio.get_running_loop().create_task(self._drain())
+            # if disconnected, reconnect now to deliver what's held
+            self._wakeup.set()
             return
         logger.warning("shutting down now")
+        self._stop_now = True
         for task in self._tasks.values():
             task.cancel()
         self._all_acked.set()
@@ -275,7 +286,7 @@ class RelayClient:
 
         # the relay acks each response: until then it may be lost, so keep the
         # connection (reconnecting if needed) for the time left
-        if self._unacked:
+        if self._unacked and not self._stop_now:
             self._all_acked.clear()
             try:
                 await asyncio.wait_for(
@@ -292,18 +303,21 @@ class RelayClient:
                 len(self._unacked),
             )
         self._stopped.set()
+        self._wakeup.set()
         # 1001: the relay fails what's left at once, rather than waiting for a
         # reconnect that won't come
         if self._ws is not None:
             await self._ws.close(code=1001, reason="client shutting down")
 
     async def _sleep_unless_stopped(self, delay: float) -> bool:
-        """Sleep for ``delay``, or until stopped: return whether stopped."""
+        if self._drain_task is not None:
+            delay = min(delay, 1.0)
         try:
-            await asyncio.wait_for(self._stopped.wait(), timeout=delay)
+            await asyncio.wait_for(self._wakeup.wait(), timeout=delay)
         except asyncio.TimeoutError:
-            return False
-        return True
+            pass
+        self._wakeup.clear()
+        return self._stopped.is_set()
 
     async def _connect(self) -> None:
         headers = {
@@ -405,6 +419,12 @@ class RelayClient:
         if deadline is None:
             deadline = time.monotonic() + self._request_timeout
         frame = {"type": "response", "request_id": request_id, "payload": payload}
+        size = len(json.dumps(frame))
+        if size > self._max_ws_message_bytes:
+            logger.warning(
+                "response for %s too large to relay (%d bytes)", request_id, size
+            )
+            frame["payload"] = _error_payload(502, "response too large to relay")
         self._drop_expired_unacked()
         self._unacked[request_id] = (deadline, frame)
         ws = self._ws

@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 
@@ -209,6 +211,7 @@ def roundtrip(make_relay_server):
         path: str = "/v1/chat/completions",
         body: dict | None = None,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        **client_kwargs,
     ) -> dict[str, dict]:
         responses: dict[str, dict] = {}
         done = asyncio.Event()
@@ -228,7 +231,9 @@ def roundtrip(make_relay_server):
             await ws.recv()  # hold the connection open until the client is torn down
 
         url = await make_relay_server(relay)
-        client = _client(url, adapter_url, request_timeout=request_timeout)
+        client = _client(
+            url, adapter_url, request_timeout=request_timeout, **client_kwargs
+        )
         async with running_client(client):
             await asyncio.wait_for(done.wait(), timeout=15)
         return responses
@@ -408,6 +413,35 @@ async def test_malformed_frame_is_dropped(make_relay_server, adapter_url, frame)
 
 
 # ── Request forwarding ────────────────────────────────────────────────────────
+
+
+async def test_response_too_large_is_replaced_with_an_error(
+    roundtrip, make_asgi_server
+):
+    """A response over the frame limit would make the relay close the connection:
+    the caller gets an error in its place."""
+
+    async def big(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        out = json.dumps({"content": "x" * 5000}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": out})
+
+    responses = await roundtrip(
+        make_asgi_server(big), ["req-1"], max_ws_message_bytes=2000
+    )
+    assert responses["req-1"]["payload"]["status"] == 502
+    assert responses["req-1"]["payload"]["body"] == {
+        "error": {"message": "response too large to relay"}
+    }
 
 
 async def test_request_forwarded_and_response_echoed(roundtrip, adapter_url):
@@ -683,12 +717,16 @@ async def test_adapter_error_is_forwarded_and_logged(
 
 
 async def _response_after_reconnect(
-    make_relay_server, make_asgi_server, adapter_delay: float
+    make_relay_server,
+    make_asgi_server,
+    adapter_delay: float,
+    reconnect_delay: float = 0,
 ) -> dict:
     """
     Send a request on a first connection, then sever it (no close frame, as a
     proxy recycling the connection does) while the adapter is still working.
-    Return the response frame the client sends on its second connection.
+    The second connection is confirmed after ``reconnect_delay``. Return the
+    response frame the client sends on it.
     """
     slow_url = make_asgi_server(_slow_completion_app(adapter_delay))
     connection_count = 0
@@ -697,11 +735,13 @@ async def _response_after_reconnect(
     async def relay(ws):
         nonlocal connection_count
         connection_count += 1
-        await ws.send(CONNECTED)
         if connection_count == 1:
+            await ws.send(CONNECTED)
             await ws.send(json.dumps(request_frame("req-1")))
             ws.transport.abort()
         else:
+            await asyncio.sleep(reconnect_delay)
+            await ws.send(CONNECTED)
             received.set_result(await recv_response(ws))
             await ws.recv()
 
@@ -711,15 +751,19 @@ async def _response_after_reconnect(
 
 
 async def test_response_held_while_disconnected_is_sent_on_reconnect(
-    make_relay_server, make_asgi_server
+    make_relay_server, make_asgi_server, caplog
 ):
-    """The adapter answers during the reconnect backoff (~1s): the response is
+    """The adapter answers while the client isn't connected: the response is
     held, then sent on the new connection."""
+    caplog.set_level(logging.INFO, logger="spectral_bridge.client")
     frame = await _response_after_reconnect(
-        make_relay_server, make_asgi_server, adapter_delay=0.3
+        make_relay_server, make_asgi_server, adapter_delay=0.2, reconnect_delay=0.6
     )
     assert frame["request_id"] == "req-1"
     assert frame["payload"]["status"] == 200
+    messages = [r.getMessage() for r in caplog.records]
+    assert "relay disconnected, holding response for req-1" in messages
+    assert "resent 1 unacked responses" in messages
 
 
 async def test_response_after_reconnect_goes_to_the_new_connection(
@@ -842,7 +886,7 @@ async def _responses_across_reconnect(
             try:
                 while True:
                     second.append(json.loads(await asyncio.wait_for(ws.recv(), 0.5)))
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 done.set()
             await ws.recv()
 
@@ -1011,6 +1055,107 @@ async def test_second_shutdown_stops_at_once(make_relay_server, make_asgi_server
     assert result["took"] < 2
 
 
+def _by_content_app(delays: dict[str, float]):
+    """A completion app whose delay depends on the message content."""
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        body = json.loads((await receive())["body"])
+        await asyncio.sleep(delays[body["messages"][0]["content"]])
+        out = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": out})
+
+    return app
+
+
+def _request_saying(request_id: str, content: str) -> dict:
+    body = {"model": "test", "messages": [{"role": "user", "content": content}]}
+    return request_frame(request_id, body=body)
+
+
+async def test_second_shutdown_stops_at_once_with_responses_unacked(
+    make_relay_server, make_asgi_server
+):
+    """A second signal stops at once even with a response still awaiting its
+    ack, rather than waiting out the grace for it."""
+    adapter = make_asgi_server(_by_content_app({"fast": 0, "slow": 2}))
+    answered = asyncio.Event()
+
+    async def relay(ws):
+        await ws.send(CONNECTED)
+        await ws.send(json.dumps(_request_saying("req-fast", "fast")))
+        await ws.send(json.dumps(_request_saying("req-slow", "slow")))
+        await recv_response(ws)  # never acked
+        answered.set()
+        with contextlib.suppress(websockets.ConnectionClosed):
+            await ws.recv()
+
+    url = await make_relay_server(relay)
+    client = _client(url, adapter, shutdown_grace=30)
+    task = asyncio.create_task(client.run())
+    await asyncio.wait_for(answered.wait(), timeout=5)
+    client.shutdown()
+    await asyncio.sleep(0.2)  # draining: waiting on the slow request
+
+    started = time.monotonic()
+    client.shutdown()
+    await asyncio.wait_for(task, timeout=5)
+    assert time.monotonic() - started < 1
+
+
+async def test_shutdown_during_a_backoff_reconnects_to_deliver_held_responses(
+    make_relay_server, make_asgi_server, monkeypatch
+):
+    """Shut down while backing off, with a response held: the client reconnects
+    at once rather than sleeping the backoff out, delivers it, then closes."""
+    monkeypatch.setattr(client_mod, "BACKOFF_SCHEDULE", [0, 30])
+    adapter = make_asgi_server(_slow_completion_app(0.2))
+    connection_count = 0
+    backing_off = asyncio.Event()
+    result: dict = {}
+
+    async def relay(ws):
+        nonlocal connection_count
+        connection_count += 1
+        if connection_count == 1:
+            await ws.send(CONNECTED)
+            await ws.send(json.dumps(request_frame("req-1")))
+            ws.transport.abort()
+        elif connection_count == 2:  # refused: the client backs off for 30s
+            backing_off.set()
+            ws.transport.abort()
+        else:
+            await ws.send(CONNECTED)
+            frame = await recv_response(ws)
+            result["response"] = frame
+            await ws.send(json.dumps({"type": "ack", "request_id": "req-1"}))
+            try:
+                await ws.recv()
+            except websockets.ConnectionClosed as exc:
+                result["close_code"] = exc.rcvd.code if exc.rcvd else None
+
+    url = await make_relay_server(relay)
+    client = _client(url, adapter)
+    task = asyncio.create_task(client.run())
+    await asyncio.wait_for(backing_off.wait(), timeout=5)
+    await asyncio.sleep(0.5)  # the adapter answers: the response is held
+
+    started = time.monotonic()
+    client.shutdown()
+    await asyncio.wait_for(task, timeout=5)
+    assert time.monotonic() - started < 2
+    assert result["response"]["request_id"] == "req-1"
+    assert result["close_code"] == 1001
+
+
 async def test_shutdown_while_reconnecting_returns(make_relay_server, adapter_url):
     """Shut down during the reconnect backoff, with nothing left to deliver: the
     client stops rather than waiting to reconnect."""
@@ -1025,9 +1170,10 @@ async def test_shutdown_while_reconnecting_returns(make_relay_server, adapter_ur
     url = await make_relay_server(relay)
     client = _client(url, adapter_url)
     task = asyncio.create_task(client.run())
-    async with asyncio.timeout(5):
-        while connection_count < 2:  # past the immediate retry: backing off
-            await asyncio.sleep(0.01)
+    for _ in range(500):
+        if connection_count >= 2:  # past the immediate retry: backing off
+            break
+        await asyncio.sleep(0.01)
     client.shutdown()
     await asyncio.wait_for(task, timeout=2)
 
@@ -1035,11 +1181,12 @@ async def test_shutdown_while_reconnecting_returns(make_relay_server, adapter_ur
 # ── Reconnect backoff ─────────────────────────────────────────────────────────
 
 
-async def test_rotation_reconnects_at_once_every_time(
-    make_relay_server, adapter_url, caplog
-):
-    """The relay rotating connections (4003) is expected: the client reconnects
-    at once each time, however short the connection was, and logs no warning."""
+async def test_rotation_reconnects_at_once(make_relay_server, adapter_url, caplog, monkeypatch):
+    """The relay rotates long-lived connections (4003): expected, so the client
+    reconnects at once, as after any long-lived connection, logging no warning.
+    Every connection counts as long-lived here."""
+    monkeypatch.setattr(client_mod, "STABLE_CONNECTION_THRESHOLD", 0)
+    caplog.set_level(logging.INFO, logger="spectral_bridge.client")
     connection_count = 0
     reconnected = asyncio.Event()
 
@@ -1057,9 +1204,9 @@ async def test_rotation_reconnects_at_once_every_time(
     started = time.monotonic()
     async with running_client(_client(url, adapter_url)):
         await asyncio.wait_for(reconnected.wait(), timeout=5)
-    # a backoff would have waited 1s, then 2s
     assert time.monotonic() - started < 1
     assert not [r for r in caplog.records if "disconnected" in r.getMessage()]
+    assert [r for r in caplog.records if "relay rotated" in r.getMessage()]
 
 
 async def test_reconnects_immediately_after_a_drop(make_relay_server, adapter_url):

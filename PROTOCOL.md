@@ -160,7 +160,9 @@ If the client's protocol version is missing or not one the server speaks, the se
 
 ### 2.2 Message Format
 
-All WebSocket frames carry UTF-8 encoded JSON. Three message types are defined: `request`, `response` and `ack`.
+All WebSocket frames carry UTF-8 encoded JSON. Four message types are defined: `connected` (§2.1), `request`, `response` and `ack`. A frame of an unknown type, or one that isn't a JSON object, is ignored: it must not close the connection.
+
+A frame is at most **16 MiB** (16,777,216 bytes). A larger one makes the receiver close the connection (code `1009`), so neither side sends one: a request too large for it fails straight away (suggested: HTTP `413`), and a response too large is replaced with an error response (suggested: status `502`).
 
 #### Inbound: Request frame (server → client)
 
@@ -179,7 +181,7 @@ All WebSocket frames carry UTF-8 encoded JSON. Three message types are defined: 
 
 `request_id` is assigned by the relay server. It is opaque to the client — treat it as a correlation token and echo it back unchanged in the response.
 
-`path` names the adapter endpoint the request targets. The client accepts only the protocol-defined endpoints — `/v1/chat/completions` and `/v1/responses` — matched exactly, and forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions` for backward compatibility. Any other `path` value is rejected: the client sends a `404` error response frame and makes no request to the adapter. This prevents a relay-supplied path from redirecting the request off the configured loopback adapter.
+`path` names the adapter endpoint the request targets. The client accepts only the protocol-defined endpoints — `/v1/chat/completions` and `/v1/responses` — matched exactly, and forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions`. Any other `path` value is rejected: the client sends a `404` error response frame and makes no request to the adapter. This prevents a relay-supplied path from redirecting the request off the configured loopback adapter.
 
 #### Outbound: Response frame (client → server)
 
@@ -239,7 +241,7 @@ The client sends a WebSocket ping frame every **30 seconds**. If no pong is rece
 
 ### 2.5 Reconnection
 
-The client reconnects automatically on any disconnect — whether caused by a network blip, relay server restart, or the client process being stopped and restarted later.
+The client reconnects automatically on any disconnect — whether caused by a network blip, relay server restart, or the client process being stopped and restarted later — except those it can't recover from by retrying: an authentication failure (`4001`, or the handshake failing with HTTP `401`/`403`), an unsupported protocol version (`4002`) and an oversized frame (`1009`). On those it stops, for the user to intervene.
 
 Reconnection uses **truncated exponential backoff**:
 
@@ -254,13 +256,13 @@ Reconnection uses **truncated exponential backoff**:
 
 The first retry is immediate: a drop is most often the infrastructure between client and server recycling a long-lived connection (a proxy or load balancer timeout), and the relay is up. A connection that stayed up long enough (the reference client uses 60 seconds) resets the schedule, so the next drop is retried immediately again.
 
-The server may close a connection with code **`4003`** (rotation) before the infrastructure between them would cut it (proxies and load balancers cap how long a connection lives, and close it with no close frame). The client reconnects at once, whatever its backoff, and pending requests carry over as with any reconnect.
+The server may close a connection with code **`4003`** (rotation) before the infrastructure between them would cut it (proxies and load balancers cap how long a connection lives, and close it with no close frame). It does so only after the connection has been up long enough to reset the backoff, so the client reconnects at once, and pending requests carry over as with any reconnect.
 
 On reconnect, the client presents the same API key. The relay server resolves the key to the same tunnel identity — the caller's endpoint does not change between reconnects.
 
 **A disconnect does not fail in-flight requests.** A request outlives the connection it was sent on, and its response may come back on a later one; only the relay server's timeout fails it. A frame sent just before a connection drops may never arrive, and the sender can't tell whether it did (TCP gives no receipt once the connection is gone), so each side keeps what it sent until it's acked, and sends it again after the reconnect:
 
-- **Client:** keeps each response until the server acks it, and after every reconnect sends again those not acked yet. It may drop a response once the relay server's timeout for it has passed.
+- **Client:** keeps each response until the server acks it, and after every reconnect sends again those not acked yet. It may drop a response once the relay server's timeout for it has passed. The protocol doesn't carry that timeout, so a client must be configured with a timeout at least as long as the server's, counted from when it receives the request.
 - **Server:** keeps each request the client hasn't acked, and after every reconnect sends it again, unless it has been answered in the meantime (the response implies the client received it, and may have already forgotten it).
 
 A frame whose send fails outright was never delivered, and isn't kept to be sent again: a request the server can't send fails straight away (suggested: HTTP `503`), and the caller may retry it. Only frames whose fate is unknown (sent, but not acked) are sent again.
@@ -268,9 +270,9 @@ A frame whose send fails outright was never delivered, and isn't kept to be sent
 Both sides deduplicate by `request_id`, so a frame received twice has no further effect:
 
 - A request frame for a request the client is still handling is acked and ignored; one it has already answered (response not acked yet) is acked, and the response sent again. **The client must never forward the same request to the adapter twice.**
-
-This holds for as long as the client process runs: its record of the requests it's handling is in memory. If the client restarts, a request it received but hadn't acked may be sent to it, and forwarded, again; one it had acked but not answered is never sent again, and only the server's timeout fails it.
 - A response frame for a request the server has already completed is acked and ignored.
+
+This holds for as long as the client process runs: its record of the requests it's handling is in memory. If the client restarts, a request it received but hadn't acked may be sent to it, and forwarded, again; one it had acked but not answered is never sent again, and only the server's timeout fails it. For the same reason, **one client process serves a key at a time**: two processes on the same key would take the connection from each other, and a request resent to the other one could reach the adapter twice.
 
 **The client must not replay requests on its own**: it forwards a request only when a request frame asks for it.
 
@@ -282,7 +284,7 @@ A disconnect the client didn't ask for is recovered from by reconnecting (§2.5)
 2. It lets the requests in flight finish, up to a grace period (the reference client allows **8 seconds**, below Docker's default 10-second stop timeout), sending their responses and waiting for the server's acks.
 3. It closes the connection with code **`1001`** (going away).
 
-On a `1001` from the client, the server fails the requests still pending on that connection straight away (suggested: HTTP `503`), rather than waiting for a reconnect. Infrastructure dropping a connection never sends `1001` (it sends no close frame at all), so the code is unambiguous.
+On a `1001` from the client, the server fails the requests still pending on that connection straight away (suggested: HTTP `503`), rather than waiting for a reconnect. Infrastructure dropping a connection normally sends no close frame at all, so a `1001` is taken to mean the client is gone; if something in between did send one, the pending requests would only fail sooner.
 
 ## 3. Relay Server
 
@@ -303,7 +305,7 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 - On reconnect with the same key: upsert the registered connection. Do not reject a reconnect from a known key.
 - On concurrent connections with the same key: accept the newer connection, close the older one with a clean WebSocket close frame.
 - Optionally, close connections with `4003` once they reach an age just below the limit the infrastructure in front of the server puts on a connection's lifetime (§2.5).
-- On a `1001` close from the client: fail its pending requests straight away (§2.6).
+- On a `1001` close from the client: fail its pending requests straight away (§2.6), unless a newer connection has already replaced that one, which then serves them.
 - When the server itself shuts down (e.g. a redeploy): close every connection, with the WebSocket close code `1012` ("Service Restart") suggested, and fail the pending requests straight away. They can't be answered on a reconnect, which reaches another server instance, so waiting for one would only hold the shutdown until they time out. The client treats the close like any other disconnect, and reconnects.
 
 **Request forwarding**
