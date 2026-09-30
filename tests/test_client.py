@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 
 import pytest
+import websockets
 from websockets.exceptions import ConnectionClosedError
 
 import spectral_bridge.client as client_mod
@@ -899,6 +900,138 @@ async def test_request_received_again_reaches_adapter_once(
     assert frames[0] == frames[1]
 
 
+# ── Shutdown ──────────────────────────────────────────────────────────────────
+
+
+async def _drain(
+    make_relay_server,
+    make_asgi_server,
+    *,
+    adapter_delay: float,
+    shutdown_grace: float,
+    shutdowns: int = 1,
+    during_drain=None,
+) -> dict:
+    """
+    Send a request to a client whose adapter takes ``adapter_delay``, shut the
+    client down (``shutdowns`` times) once it acked it, and ack each response.
+    ``during_drain(ws)`` runs right after the shutdown. Return the response
+    frames received, the close code, and how long the shutdown took.
+    """
+    app, calls = _counting_completion_app(adapter_delay)
+    adapter = make_asgi_server(app)
+    result: dict = {"responses": [], "calls": calls}
+    closed = asyncio.Event()
+    client: RelayClient
+
+    async def relay(ws):
+        await ws.send(CONNECTED)
+        await ws.send(json.dumps(request_frame("req-1")))
+        assert json.loads(await ws.recv())["type"] == "ack"
+        result["started"] = time.monotonic()
+        for _ in range(shutdowns):
+            client.shutdown()
+        if during_drain is not None:
+            await during_drain(ws)
+        try:
+            while True:
+                frame = json.loads(await ws.recv())
+                if frame["type"] == "response":
+                    result["responses"].append(frame)
+                    await ws.send(
+                        json.dumps({"type": "ack", "request_id": frame["request_id"]})
+                    )
+        except websockets.ConnectionClosed as exc:
+            result["close_code"] = exc.rcvd.code if exc.rcvd else None
+            closed.set()
+
+    url = await make_relay_server(relay)
+    client = _client(url, adapter, shutdown_grace=shutdown_grace)
+    await asyncio.wait_for(client.run(), timeout=10)
+    result["took"] = time.monotonic() - result["started"]
+    await asyncio.wait_for(closed.wait(), timeout=2)
+    return result
+
+
+async def test_shutdown_finishes_in_flight_requests_then_closes(
+    make_relay_server, make_asgi_server
+):
+    """In-flight requests finish, their responses are acked, and the client
+    closes with 1001: the relay fails at once whatever is left."""
+    result = await _drain(
+        make_relay_server, make_asgi_server, adapter_delay=0.3, shutdown_grace=5
+    )
+    assert [f["payload"]["status"] for f in result["responses"]] == [200]
+    assert result["close_code"] == 1001
+    # closed once acked, not at the end of the grace
+    assert result["took"] < 2
+
+
+async def test_shutdown_refuses_new_requests(make_relay_server, make_asgi_server):
+    """A request received while draining is answered 503 at once, without
+    reaching the adapter, so the caller can retry it."""
+
+    async def send_another(ws):
+        await ws.send(json.dumps(request_frame("req-2")))
+
+    result = await _drain(
+        make_relay_server,
+        make_asgi_server,
+        adapter_delay=0.3,
+        shutdown_grace=5,
+        during_drain=send_another,
+    )
+    by_id = {f["request_id"]: f["payload"] for f in result["responses"]}
+    assert by_id["req-2"]["status"] == 503
+    assert by_id["req-2"]["body"] == {"error": {"message": "client shutting down"}}
+    assert by_id["req-1"]["status"] == 200
+    assert len(result["calls"]) == 1
+
+
+async def test_shutdown_closes_once_the_grace_is_over(
+    make_relay_server, make_asgi_server
+):
+    result = await _drain(
+        make_relay_server, make_asgi_server, adapter_delay=5, shutdown_grace=0.3
+    )
+    assert result["responses"] == []
+    assert result["close_code"] == 1001
+    assert result["took"] < 2
+
+
+async def test_second_shutdown_stops_at_once(make_relay_server, make_asgi_server):
+    result = await _drain(
+        make_relay_server,
+        make_asgi_server,
+        adapter_delay=5,
+        shutdown_grace=30,
+        shutdowns=2,
+    )
+    assert result["close_code"] == 1001
+    assert result["took"] < 2
+
+
+async def test_shutdown_while_reconnecting_returns(make_relay_server, adapter_url):
+    """Shut down during the reconnect backoff, with nothing left to deliver: the
+    client stops rather than waiting to reconnect."""
+    connection_count = 0
+
+    async def relay(ws):
+        nonlocal connection_count
+        connection_count += 1
+        await ws.send(CONNECTED)
+        ws.transport.abort()
+
+    url = await make_relay_server(relay)
+    client = _client(url, adapter_url)
+    task = asyncio.create_task(client.run())
+    async with asyncio.timeout(5):
+        while connection_count < 2:  # past the immediate retry: backing off
+            await asyncio.sleep(0.01)
+    client.shutdown()
+    await asyncio.wait_for(task, timeout=2)
+
+
 # ── Reconnect backoff ─────────────────────────────────────────────────────────
 
 
@@ -930,8 +1063,8 @@ async def _capture_backoff_delays(monkeypatch, *, stable_threshold: float) -> li
     """
     Drive run()'s reconnect loop with an always-failing connection, capturing the
     backoff delay used on each iteration. _connect is stubbed to fail immediately
-    and asyncio.sleep is stubbed to record (not wait), so no real network or time
-    is involved; only the loop's delay arithmetic is exercised.
+    and the backoff sleep is stubbed to record (not wait), so no real network or
+    time is involved; only the loop's delay arithmetic is exercised.
     """
     client = _client("ws://relay.test/connect", "http://localhost:1")
     monkeypatch.setattr(client_mod, "BACKOFF_SCHEDULE", [1, 2, 4, 8])
@@ -943,22 +1076,14 @@ async def _capture_backoff_delays(monkeypatch, *, stable_threshold: float) -> li
         # abnormal closure, no close frame -> falls through to the backoff branch
         raise ConnectionClosedError(None, None)
 
-    # Patching asyncio.sleep is global, so it also hits background servers (e.g. the
-    # session-scoped adapter) running on other event loops. Record and short-circuit
-    # only this loop's backoff sleeps; let every other loop sleep for real.
-    loop = asyncio.get_running_loop()
-    real_sleep = asyncio.sleep
-
     async def fake_sleep(delay):
-        if asyncio.get_running_loop() is not loop:
-            await real_sleep(delay)
-            return
         delays.append(delay)
         if len(delays) >= 4:
             raise asyncio.CancelledError
+        return False  # not stopped
 
     monkeypatch.setattr(client, "_connect", fake_connect)
-    monkeypatch.setattr(client_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(client, "_sleep_unless_stopped", fake_sleep)
 
     with pytest.raises(asyncio.CancelledError):
         await client.run()

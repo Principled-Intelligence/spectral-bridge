@@ -45,14 +45,15 @@ ADAPTER_ALLOWED_PATHS = frozenset({ADAPTER_CHAT_PATH, ADAPTER_RESPONSES_PATH})
 
 DEFAULT_MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
 
-# logged bodies are truncated: they are unbounded and may echo request content
 MAX_LOG_BODY_CHARS = 1024
 
-# Max time to wait for the adapter to return a completion. Long completions are
-# real, so this is generous; the default is matched to the Spectral relay's
-# server-side timeout. On another platform keep it >= that relay's timeout so
-# the server is the authority on giving up rather than the client.
+# Max time to wait for the adapter to return a completion
 DEFAULT_REQUEST_TIMEOUT = 600.0
+
+# Max time a shutdown waits for in-flight requests to finish, and their
+# responses to be acked, before closing: those not done by then are failed by
+# the relay
+DEFAULT_SHUTDOWN_GRACE = 8.0
 _CONNECT_TIMEOUT = 10.0
 
 # Strip hop-by-hop / connection-specific fields when rebuilding a POST to localhost.
@@ -95,16 +96,20 @@ class RelayClient:
         insecure_adapter: bool = False,
         max_ws_message_bytes: int = DEFAULT_MAX_WS_MESSAGE_BYTES,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE,
     ) -> None:
         if max_ws_message_bytes < 1:
             raise ValueError("max_ws_message_bytes must be at least 1")
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
+        if shutdown_grace < 0:
+            raise ValueError("shutdown_grace must not be negative")
         self.relay_url = relay_url
         self.api_key = api_key
         self.adapter_url = adapter_url.rstrip("/")
         self._max_ws_message_bytes = max_ws_message_bytes
         self._request_timeout = request_timeout
+        self._shutdown_grace = shutdown_grace
         self._http: httpx.AsyncClient | None = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._ws: ClientConnection | None = None
@@ -113,6 +118,12 @@ class RelayClient:
         # acked are sent again on every reconnect, until the deadline past which
         # the relay has given up on them
         self._unacked: dict[str, tuple[float, dict[str, Any]]] = {}
+        # set while draining once _unacked is empty, or to stop waiting for it
+        self._all_acked = asyncio.Event()
+        # the shutdown, once requested: new requests are refused while draining
+        self._drain_task: asyncio.Task | None = None
+        # set once drained: run() then returns rather than reconnecting
+        self._stopped = asyncio.Event()
         self._validate_relay_url(insecure_relay)
         self._validate_adapter_url(insecure_adapter)
 
@@ -217,17 +228,77 @@ class RelayClient:
                 # must happen on every disconnect path (abnormal closures raise
                 # rather than return), otherwise transient drops accumulate and
                 # the delay keeps escalating even between healthy sessions.
+                if self._stopped.is_set():
+                    return
                 if time.monotonic() - t0 >= STABLE_CONNECTION_THRESHOLD:
                     attempt = 0
                 delay = BACKOFF_SCHEDULE[min(attempt, len(BACKOFF_SCHEDULE) - 1)]
                 logger.warning("disconnected (%s), reconnecting in %ds", reason, delay)
-                await asyncio.sleep(delay)
+                if await self._sleep_unless_stopped(delay):
+                    return
                 attempt += 1
         finally:
             await self._cancel_inflight_handlers()
             if self._http is not None:
                 await self._http.aclose()
                 self._http = None
+
+    def shutdown(self) -> None:
+        """Shut down gracefully: finish the requests in flight, then close.
+
+        New requests are refused meanwhile. Called again, it stops now,
+        cancelling the requests in flight. Safe to call from a signal handler.
+        """
+        if self._drain_task is None:
+            self._drain_task = asyncio.get_running_loop().create_task(self._drain())
+            return
+        logger.warning("shutting down now")
+        for task in self._tasks.values():
+            task.cancel()
+        self._all_acked.set()
+
+    async def _drain(self) -> None:
+        deadline = time.monotonic() + self._shutdown_grace
+        tasks = list(self._tasks.values())
+        logger.info(
+            "shutting down, finishing %d in-flight requests (up to %gs)",
+            len(tasks),
+            self._shutdown_grace,
+        )
+        if tasks:
+            await asyncio.wait(tasks, timeout=self._shutdown_grace)
+
+        # the relay acks each response: until then it may be lost, so keep the
+        # connection (reconnecting if needed) for the time left
+        if self._unacked:
+            self._all_acked.clear()
+            try:
+                await asyncio.wait_for(
+                    self._all_acked.wait(), max(0.0, deadline - time.monotonic())
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        unfinished = sum(not task.done() for task in tasks)
+        if unfinished or self._unacked:
+            logger.warning(
+                "shutdown grace over: %d requests unfinished, %d responses unacked",
+                unfinished,
+                len(self._unacked),
+            )
+        self._stopped.set()
+        # 1001: the relay fails what's left at once, rather than waiting for a
+        # reconnect that won't come
+        if self._ws is not None:
+            await self._ws.close(code=1001, reason="client shutting down")
+
+    async def _sleep_unless_stopped(self, delay: float) -> bool:
+        """Sleep for ``delay``, or until stopped: return whether stopped."""
+        try:
+            await asyncio.wait_for(self._stopped.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     async def _connect(self) -> None:
         headers = {
@@ -248,6 +319,10 @@ class RelayClient:
             if msg.get("protocol") != PROTOCOL_VERSION:
                 raise _UnsupportedRelay(msg.get("protocol"))
             logger.info("connected to relay")
+            if self._stopped.is_set():
+                # the shutdown ended while this connection was being made
+                await ws.close(code=1001, reason="client shutting down")
+                return
 
             self._ws = ws
             try:
@@ -282,6 +357,8 @@ class RelayClient:
                 await self._on_request(ws, request_id, payload)
             else:
                 self._unacked.pop(request_id, None)
+                if not self._unacked:
+                    self._all_acked.set()
 
     async def _on_request(
         self, ws: ClientConnection, request_id: str, payload: dict[str, Any]
@@ -297,6 +374,12 @@ class RelayClient:
             await _send(ws, self._unacked[request_id][1])
             return
 
+        if self._drain_task is not None:
+            # refused at once, so the caller can retry it elsewhere, or later
+            logger.info("shutting down, refusing request %s", request_id)
+            await self._respond(request_id, _error_payload(503, "client shutting down"))
+            return
+
         task = asyncio.create_task(self._handle_request(request_id, payload))
         self._tasks[request_id] = task
         task.add_done_callback(lambda _: self._tasks.pop(request_id, None))
@@ -305,7 +388,18 @@ class RelayClient:
         # past this, the relay stops waiting for the response
         deadline = time.monotonic() + self._request_timeout
         response = await self._call_adapter(request_id, payload)
-        frame = {"type": "response", "request_id": request_id, "payload": response}
+        await self._respond(request_id, response, deadline)
+
+    async def _respond(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+        deadline: float | None = None,
+    ) -> None:
+        """Send a response, keeping it until the relay acks it."""
+        if deadline is None:
+            deadline = time.monotonic() + self._request_timeout
+        frame = {"type": "response", "request_id": request_id, "payload": payload}
         self._drop_expired_unacked()
         self._unacked[request_id] = (deadline, frame)
         ws = self._ws

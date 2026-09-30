@@ -272,6 +272,16 @@ This holds for as long as the client process runs: its record of the requests it
 
 **The client must not replay requests on its own**: it forwards a request only when a request frame asks for it.
 
+### 2.6 Shutdown
+
+A disconnect the client didn't ask for is recovered from by reconnecting (§2.5). When the client itself stops (e.g. its process is asked to terminate), it won't come back to answer what's pending, so it tells the server, after finishing what it can:
+
+1. It stops taking new requests: a request frame received from now on is acked and answered at once with an error response (suggested: status `503`), without reaching the adapter, so the caller can retry it.
+2. It lets the requests in flight finish, up to a grace period (the reference client allows **8 seconds**, below Docker's default 10-second stop timeout), sending their responses and waiting for the server's acks.
+3. It closes the connection with code **`1001`** (going away).
+
+On a `1001` from the client, the server fails the requests still pending on that connection straight away (suggested: HTTP `503`), rather than waiting for a reconnect. Infrastructure dropping a connection never sends `1001` (it sends no close frame at all), so the code is unambiguous.
+
 ## 3. Relay Server
 
 Only the `/connect` WebSocket endpoint is mandatory — it is the protocol boundary that any conforming relay client interoperates with. How the server exposes a forwarding endpoint to its callers is an implementation concern; the sections below describe three progressively richer designs.
@@ -290,6 +300,7 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 
 - On reconnect with the same key: upsert the registered connection. Do not reject a reconnect from a known key.
 - On concurrent connections with the same key: accept the newer connection, close the older one with a clean WebSocket close frame.
+- On a `1001` close from the client: fail its pending requests straight away (§2.6).
 - When the server itself shuts down (e.g. a redeploy): close every connection, with the WebSocket close code `1012` ("Service Restart") suggested, and fail the pending requests straight away. They can't be answered on a reconnect, which reaches another server instance, so waiting for one would only hold the shutdown until they time out. The client treats the close like any other disconnect, and reconnects.
 
 **Request forwarding**
