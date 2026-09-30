@@ -245,11 +245,14 @@ Reconnection uses **truncated exponential backoff**:
 
 | Attempt | Delay  |
 |---------|--------|
-| 1       | 1 s    |
-| 2       | 2 s    |
-| 3       | 4 s    |
-| 4       | 8 s    |
-| 5+      | 30 s   |
+| 1       | 0 s    |
+| 2       | 1 s    |
+| 3       | 2 s    |
+| 4       | 4 s    |
+| 5       | 8 s    |
+| 6+      | 30 s   |
+
+The first retry is immediate: a drop is most often the infrastructure between client and server recycling a long-lived connection (a proxy or load balancer timeout), and the relay is up. A connection that stayed up long enough (the reference client uses 60 seconds) resets the schedule, so the next drop is retried immediately again.
 
 On reconnect, the client presents the same API key. The relay server resolves the key to the same tunnel identity — the caller's endpoint does not change between reconnects.
 
@@ -294,7 +297,8 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 - Await the corresponding response frame, matched by `request_id`, across reconnects: a disconnect does not fail pending requests, and requests neither acked nor answered yet are sent again on the next connection (§2.5).
 - If a request frame can't be sent: return an error to the caller immediately (suggested: HTTP `503`).
 - Ack every response frame (§2.2).
-- If no active connection exists: return an error to the caller immediately (suggested: HTTP `503`).
+- If no client has connected yet: return an error to the caller immediately (suggested: HTTP `503`).
+- If the client was connected but is not right now: wait briefly for it to reconnect (the reference implementation waits up to **10 seconds**), then send the request, or return an error if it doesn't come back (suggested: HTTP `503`). Nothing has been sent yet, so waiting is safe, and the second a reconnect takes isn't an error for the caller.
 - If no response frame is received within the server's timeout: return an error to the caller (suggested: HTTP `504`). Completions can be long, so the timeout should be generous (the reference implementation uses **600 seconds**), and clients should keep their own adapter timeout at least as long.
 
 ### 3.2 Suggested: Simple scenario

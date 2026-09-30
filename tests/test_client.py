@@ -622,8 +622,9 @@ async def test_reconnects_after_disconnect(make_relay_server, adapter_url):
 async def test_abnormal_closure_reconnects(make_relay_server, adapter_url):
     """
     An infra-style disconnect — TCP severed with no close frame (the 1006
-    "no close frame received or sent" case, e.g. a proxy or Cloud Run request-
-    timeout recycle) — is transient: the client reconnects rather than stopping.
+    "no close frame received or sent" case, e.g. a proxy or load balancer
+    recycling the connection) — is transient: the client reconnects rather than
+    stopping.
     """
     connection_count = 0
     reconnected = asyncio.Event()
@@ -684,8 +685,8 @@ async def _response_after_reconnect(
     make_relay_server, make_asgi_server, adapter_delay: float
 ) -> dict:
     """
-    Send a request on a first connection, then sever it (no close frame, as
-    Cloud Run does at its request timeout) while the adapter is still working.
+    Send a request on a first connection, then sever it (no close frame, as a
+    proxy recycling the connection does) while the adapter is still working.
     Return the response frame the client sends on its second connection.
     """
     slow_url = make_asgi_server(_slow_completion_app(adapter_delay))
@@ -899,6 +900,30 @@ async def test_request_received_again_reaches_adapter_once(
 
 
 # ── Reconnect backoff ─────────────────────────────────────────────────────────
+
+
+async def test_reconnects_immediately_after_a_drop(make_relay_server, adapter_url):
+    """The first retry is immediate: a drop is usually the infrastructure
+    recycling the connection, and the relay is up."""
+    dropped_at = None
+    reconnected = asyncio.Event()
+    connection_count = 0
+
+    async def relay(ws):
+        nonlocal connection_count, dropped_at
+        connection_count += 1
+        await ws.send(CONNECTED)
+        if connection_count == 1:
+            dropped_at = time.monotonic()
+            ws.transport.abort()
+        else:
+            reconnected.set()
+            await ws.recv()
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(reconnected.wait(), timeout=5)
+        assert time.monotonic() - dropped_at < 0.5
 
 
 async def _capture_backoff_delays(monkeypatch, *, stable_threshold: float) -> list:
