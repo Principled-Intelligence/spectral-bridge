@@ -290,6 +290,7 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 
 - On reconnect with the same key: upsert the registered connection. Do not reject a reconnect from a known key.
 - On concurrent connections with the same key: accept the newer connection, close the older one with a clean WebSocket close frame.
+- When the server itself shuts down (e.g. a redeploy): close every connection, with the WebSocket close code `1012` ("Service Restart") suggested, and fail the pending requests straight away. They can't be answered on a reconnect, which reaches another server instance, so waiting for one would only hold the shutdown until they time out. The client treats the close like any other disconnect, and reconnects.
 
 **Request forwarding**
 
