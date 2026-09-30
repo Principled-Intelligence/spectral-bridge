@@ -154,7 +154,7 @@ On successful authentication, the server sends a confirmation frame before any r
 
 The client should surface this to the user (e.g. print to terminal).
 
-If authentication fails, the server closes the connection with code `4001`. The client must not retry with the same key without user intervention.
+If authentication fails, the server refuses the connection with code `4001`. Closed before being accepted, it reaches the client as a failed handshake (typically HTTP `403`) rather than as the code itself, so the client treats both as an authentication failure. The client must not retry with the same key without user intervention.
 
 If the client's protocol version is missing or not one the server speaks, the server closes the connection with code `4002`. Versions are not negotiated: client and server must speak the same one, and the client must be upgraded (or downgraded) to connect. Like `4001`, the client must not retry without user intervention.
 
@@ -256,11 +256,15 @@ On reconnect, the client presents the same API key. The relay server resolves th
 **A disconnect does not fail in-flight requests.** A request outlives the connection it was sent on, and its response may come back on a later one; only the relay server's timeout fails it. A frame sent just before a connection drops may never arrive, and the sender can't tell whether it did (TCP gives no receipt once the connection is gone), so each side keeps what it sent until it's acked, and sends it again after the reconnect:
 
 - **Client:** keeps each response until the server acks it, and after every reconnect sends again those not acked yet. It may drop a response once the relay server's timeout for it has passed.
-- **Server:** keeps each request the client hasn't acked, and after every reconnect sends it again.
+- **Server:** keeps each request the client hasn't acked, and after every reconnect sends it again, unless it has been answered in the meantime (the response implies the client received it, and may have already forgotten it).
+
+A frame whose send fails outright was never delivered, and isn't kept to be sent again: a request the server can't send fails straight away (suggested: HTTP `503`), and the caller may retry it. Only frames whose fate is unknown (sent, but not acked) are sent again.
 
 Both sides deduplicate by `request_id`, so a frame received twice has no further effect:
 
 - A request frame for a request the client is still handling is acked and ignored; one it has already answered (response not acked yet) is acked, and the response sent again. **The client must never forward the same request to the adapter twice.**
+
+This holds for as long as the client process runs: its record of the requests it's handling is in memory. If the client restarts, a request it received but hadn't acked may be sent to it, and forwarded, again; one it had acked but not answered is never sent again, and only the server's timeout fails it.
 - A response frame for a request the server has already completed is acked and ignored.
 
 **The client must not replay requests on its own**: it forwards a request only when a request frame asks for it.
@@ -274,7 +278,7 @@ Only the `/connect` WebSocket endpoint is mandatory — it is the protocol bound
 The server must expose a public WebSocket endpoint at `/connect`. On connection:
 
 - Read the `Spectral-Bridge-Protocol` header. If absent or not a supported version, accept the connection and close it with code `4002` (accepting first makes the code reach the client; a connection closed before being accepted is rejected with an HTTP error instead).
-- Read the `Authorization: Bearer <api-key>` header. If absent or invalid, close with code `4001`.
+- Read the `Authorization: Bearer <api-key>` header. If absent or invalid, close with code `4001` (the reference implementation does so before accepting, so clients see a failed handshake, see §2.1).
 - Validate the key. The same key must always authenticate to the same connection slot, regardless of how many times the client reconnects.
 - Register the active WebSocket connection.
 - Send a `{ "type": "connected", "protocol": <version> }` frame before any request frames.
@@ -287,7 +291,8 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 **Request forwarding**
 
 - Push request frames to the active connection.
-- Await the corresponding response frame, matched by `request_id`, across reconnects: a disconnect does not fail pending requests, and requests not acked yet are sent again on the next connection (§2.5).
+- Await the corresponding response frame, matched by `request_id`, across reconnects: a disconnect does not fail pending requests, and requests neither acked nor answered yet are sent again on the next connection (§2.5).
+- If a request frame can't be sent: return an error to the caller immediately (suggested: HTTP `503`).
 - Ack every response frame (§2.2).
 - If no active connection exists: return an error to the caller immediately (suggested: HTTP `503`).
 - If no response frame is received within the server's timeout: return an error to the caller (suggested: HTTP `504`). Completions can be long, so the timeout should be generous (the reference implementation uses **600 seconds**), and clients should keep their own adapter timeout at least as long.

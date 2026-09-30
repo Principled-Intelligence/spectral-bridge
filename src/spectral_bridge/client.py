@@ -242,9 +242,8 @@ class RelayClient:
             max_size=self._max_ws_message_bytes,
         ) as ws:
             # wait for the connected confirmation frame
-            raw = await ws.recv()
-            msg = json.loads(raw)
-            if msg.get("type") != "connected":
+            msg = _parse_frame(await ws.recv())
+            if msg is None or msg.get("type") != "connected":
                 raise ProtocolError(f"unexpected first frame: {msg}")
             if msg.get("protocol") != PROTOCOL_VERSION:
                 raise _UnsupportedRelay(msg.get("protocol"))
@@ -259,14 +258,30 @@ class RelayClient:
 
     async def _listen(self, ws: ClientConnection) -> None:
         async for raw in ws:
-            data = json.loads(raw)
+            # a malformed frame is logged and dropped: it must not stop the
+            # client, and every other request it's handling
+            data = _parse_frame(raw)
+            if data is None:
+                logger.warning("malformed frame: %s", _for_log(raw))
+                continue
+
             msg_type = data.get("type")
-            if msg_type == "request":
-                await self._on_request(ws, data["request_id"], data["payload"])
-            elif msg_type == "ack":
-                self._unacked.pop(data["request_id"], None)
-            else:
+            if msg_type not in ("request", "ack"):
                 logger.warning("unknown frame type=%s", msg_type)
+                continue
+
+            request_id = data.get("request_id")
+            payload = data.get("payload")
+            if not isinstance(request_id, str) or (
+                msg_type == "request" and not isinstance(payload, dict)
+            ):
+                logger.warning("malformed frame: %s", _for_log(raw))
+                continue
+
+            if msg_type == "request":
+                await self._on_request(ws, request_id, payload)
+            else:
+                self._unacked.pop(request_id, None)
 
     async def _on_request(
         self, ws: ClientConnection, request_id: str, payload: dict[str, Any]
@@ -291,20 +306,24 @@ class RelayClient:
         deadline = time.monotonic() + self._request_timeout
         response = await self._call_adapter(request_id, payload)
         frame = {"type": "response", "request_id": request_id, "payload": response}
+        self._drop_expired_unacked()
         self._unacked[request_id] = (deadline, frame)
         ws = self._ws
         if ws is None or not await _send(ws, frame):
             logger.info("relay disconnected, holding response for %s", request_id)
 
+    def _drop_expired_unacked(self) -> None:
+        """Drop the responses the relay has given up on, never acked."""
+        now = time.monotonic()
+        for request_id, (deadline, _) in list(self._unacked.items()):
+            if now > deadline:
+                del self._unacked[request_id]
+                logger.warning("dropped response for %s, never acked", request_id)
+
     async def _resend_unacked(self, ws: ClientConnection) -> None:
+        self._drop_expired_unacked()
         resent = 0
-        for request_id, (deadline, frame) in list(self._unacked.items()):
-            if time.monotonic() > deadline:
-                self._unacked.pop(request_id, None)
-                logger.warning(
-                    "dropped response for %s, relay reconnected too late", request_id
-                )
-                continue
+        for _, frame in list(self._unacked.values()):
             if not await _send(ws, frame):
                 break
             resent += 1
@@ -355,6 +374,15 @@ class _UnsupportedRelay(Exception):
     def __init__(self, version: object) -> None:
         super().__init__(f"relay speaks protocol version {version}")
         self.version = version
+
+
+def _parse_frame(raw: str | bytes) -> dict[str, Any] | None:
+    """A frame's JSON object, or None if it isn't one."""
+    try:
+        data = json.loads(raw)
+    except ValueError:  # not JSON, or bytes that aren't UTF-8
+        return None
+    return data if isinstance(data, dict) else None
 
 
 async def _send(ws: ClientConnection, frame: dict[str, Any]) -> bool:

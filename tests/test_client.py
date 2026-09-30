@@ -368,6 +368,44 @@ async def test_unexpected_first_frame_reconnects(make_relay_server, adapter_url)
     assert connection_count == 2
 
 
+@pytest.mark.parametrize(
+    "frame",
+    [
+        "not json",
+        '["not", "an", "object"]',
+        json.dumps({"type": "request", "payload": {}}),
+        json.dumps({"type": "request", "request_id": "req-0"}),
+        json.dumps({"type": "ack", "request_id": ["req-0"]}),
+        json.dumps({"type": "ping"}),
+    ],
+    ids=[
+        "not-json",
+        "not-an-object",
+        "request-without-id",
+        "request-without-payload",
+        "ack-with-bad-id",
+        "unknown-type",
+    ],
+)
+async def test_malformed_frame_is_dropped(make_relay_server, adapter_url, frame):
+    """A malformed frame is logged and dropped: the client keeps serving the
+    connection, rather than stopping."""
+    received: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    async def relay(ws):
+        await ws.send(CONNECTED)
+        await ws.send(frame)
+        await ws.send(json.dumps(request_frame("req-1")))
+        received.set_result(await recv_response(ws))
+        await ws.recv()
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)) as task:
+        response = await asyncio.wait_for(received, timeout=10)
+        assert not task.done()
+    assert response["request_id"] == "req-1"
+
+
 # ── Request forwarding ────────────────────────────────────────────────────────
 
 
@@ -715,6 +753,22 @@ async def test_held_response_past_its_deadline_is_dropped():
 
     assert [frame["request_id"] for frame in ws.sent] == ["new"]
     # kept until acked
+    assert list(client._unacked) == ["new"]
+
+
+async def test_expired_responses_are_dropped_as_new_ones_are_held(monkeypatch):
+    """Responses the relay never acked don't pile up while connected: expired
+    ones go as soon as another response is held."""
+    client = _client("ws://relay.test/connect", "http://localhost:1")
+    expired = {"type": "response", "request_id": "old", "payload": {"status": 200}}
+    client._unacked = {"old": (time.monotonic() - 1, expired)}
+
+    async def call_adapter(request_id, payload):
+        return {"status": 200, "headers": {}, "body": {}}
+
+    monkeypatch.setattr(client, "_call_adapter", call_adapter)
+    await client._handle_request("new", {})
+
     assert list(client._unacked) == ["new"]
 
 
