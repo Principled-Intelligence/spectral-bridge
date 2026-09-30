@@ -1035,6 +1035,33 @@ async def test_shutdown_while_reconnecting_returns(make_relay_server, adapter_ur
 # ── Reconnect backoff ─────────────────────────────────────────────────────────
 
 
+async def test_rotation_reconnects_at_once_every_time(
+    make_relay_server, adapter_url, caplog
+):
+    """The relay rotating connections (4003) is expected: the client reconnects
+    at once each time, however short the connection was, and logs no warning."""
+    connection_count = 0
+    reconnected = asyncio.Event()
+
+    async def relay(ws):
+        nonlocal connection_count
+        connection_count += 1
+        await ws.send(CONNECTED)
+        if connection_count <= 3:
+            await ws.close(code=4003, reason="connection rotation")
+        else:
+            reconnected.set()
+            await ws.recv()
+
+    url = await make_relay_server(relay)
+    started = time.monotonic()
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(reconnected.wait(), timeout=5)
+    # a backoff would have waited 1s, then 2s
+    assert time.monotonic() - started < 1
+    assert not [r for r in caplog.records if "disconnected" in r.getMessage()]
+
+
 async def test_reconnects_immediately_after_a_drop(make_relay_server, adapter_url):
     """The first retry is immediate: a drop is usually the infrastructure
     recycling the connection, and the relay is up."""

@@ -254,6 +254,8 @@ Reconnection uses **truncated exponential backoff**:
 
 The first retry is immediate: a drop is most often the infrastructure between client and server recycling a long-lived connection (a proxy or load balancer timeout), and the relay is up. A connection that stayed up long enough (the reference client uses 60 seconds) resets the schedule, so the next drop is retried immediately again.
 
+The server may close a connection with code **`4003`** (rotation) before the infrastructure between them would cut it (proxies and load balancers cap how long a connection lives, and close it with no close frame). The client reconnects at once, whatever its backoff, and pending requests carry over as with any reconnect.
+
 On reconnect, the client presents the same API key. The relay server resolves the key to the same tunnel identity — the caller's endpoint does not change between reconnects.
 
 **A disconnect does not fail in-flight requests.** A request outlives the connection it was sent on, and its response may come back on a later one; only the relay server's timeout fails it. A frame sent just before a connection drops may never arrive, and the sender can't tell whether it did (TCP gives no receipt once the connection is gone), so each side keeps what it sent until it's acked, and sends it again after the reconnect:
@@ -300,6 +302,7 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 
 - On reconnect with the same key: upsert the registered connection. Do not reject a reconnect from a known key.
 - On concurrent connections with the same key: accept the newer connection, close the older one with a clean WebSocket close frame.
+- Optionally, close connections with `4003` once they reach an age just below the limit the infrastructure in front of the server puts on a connection's lifetime (§2.5).
 - On a `1001` close from the client: fail its pending requests straight away (§2.6).
 - When the server itself shuts down (e.g. a redeploy): close every connection, with the WebSocket close code `1012` ("Service Restart") suggested, and fail the pending requests straight away. They can't be answered on a reconnect, which reaches another server instance, so waiting for one would only hold the shutdown until they time out. The client treats the close like any other disconnect, and reconnects.
 

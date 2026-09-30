@@ -199,6 +199,11 @@ class RelayClient:
                             exc.rcvd.reason,
                         )
                         return
+                    rotated = exc.rcvd is not None and exc.rcvd.code == 4003
+                    if rotated and not self._stopped.is_set():
+                        logger.info("relay rotated the connection, reconnecting")
+                        attempt = 0
+                        continue
                     sent_1009 = exc.sent is not None and exc.sent.code == 1009
                     rcvd_1009 = exc.rcvd is not None and exc.rcvd.code == 1009
                     if sent_1009 or rcvd_1009:
