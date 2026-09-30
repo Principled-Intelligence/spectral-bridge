@@ -144,6 +144,16 @@ def test_validate_max_bytes_zero_raises():
 
 DEFAULT_BODY = {"model": "test", "messages": [{"role": "user", "content": "hello"}]}
 
+CONNECTED = json.dumps({"type": "connected", "protocol": 2})
+
+
+async def recv_response(ws) -> dict:
+    """The next response frame from the client, skipping its request acks."""
+    while True:
+        frame = json.loads(await ws.recv())
+        if frame["type"] == "response":
+            return frame
+
 
 def _client(relay_url: str, adapter_url: str, **kwargs) -> RelayClient:
     """Build a RelayClient with insecure_relay=True for the ws:// test URLs."""
@@ -203,13 +213,15 @@ def roundtrip(make_relay_server):
         done = asyncio.Event()
 
         async def relay(ws):
-            await ws.send(json.dumps({"type": "connected"}))
+            await ws.send(CONNECTED)
             # send every request before reading any response, so concurrent
             # handling is exercised when more than one id is requested
             for request_id in request_ids:
-                await ws.send(json.dumps(request_frame(request_id, body=body, path=path)))
+                await ws.send(
+                    json.dumps(request_frame(request_id, body=body, path=path))
+                )
             for _ in request_ids:
-                frame = json.loads(await ws.recv())
+                frame = await recv_response(ws)
                 responses[frame["request_id"]] = frame
             done.set()
             await ws.recv()  # hold the connection open until the client is torn down
@@ -231,7 +243,7 @@ async def test_connected_frame_accepted(make_relay_server, adapter_url):
     ready = asyncio.Event()
 
     async def relay(ws):
-        await ws.send(json.dumps({"type": "connected"}))
+        await ws.send(CONNECTED)
         ready.set()
         await ws.recv()
 
@@ -308,6 +320,32 @@ async def test_transient_handshake_status_reconnects(make_relay_server, adapter_
     finally:
         unavailable.close()
         await unavailable.wait_closed()
+
+
+async def test_protocol_version_refused_by_relay_stops_client(
+    make_relay_server, adapter_url
+):
+    """The relay refuses this client's protocol version (4002) → run() returns."""
+
+    async def relay(ws):
+        await ws.close(code=4002, reason="unsupported protocol version, expected 3")
+
+    url = await make_relay_server(relay)
+    await asyncio.wait_for(_client(url, adapter_url).run(), timeout=5)
+
+
+async def test_relay_speaking_another_protocol_stops_client(
+    make_relay_server, adapter_url
+):
+    """A relay whose connected frame names no (or another) version → run()
+    returns: an older relay would neither ack nor deduplicate."""
+
+    async def relay(ws):
+        await ws.send(json.dumps({"type": "connected"}))
+        await ws.recv()
+
+    url = await make_relay_server(relay)
+    await asyncio.wait_for(_client(url, adapter_url).run(), timeout=5)
 
 
 async def test_unexpected_first_frame_reconnects(make_relay_server, adapter_url):
@@ -405,9 +443,9 @@ async def _drive_one_frame(make_relay_server, adapter_url: str, frame: dict) -> 
     done = asyncio.Event()
 
     async def relay(ws):
-        await ws.send(json.dumps({"type": "connected"}))
+        await ws.send(CONNECTED)
         await ws.send(json.dumps(frame))
-        result["response"] = json.loads(await ws.recv())
+        result["response"] = await recv_response(ws)
         done.set()
         await ws.recv()  # hold open until the client is torn down
 
@@ -531,7 +569,7 @@ async def test_reconnects_after_disconnect(make_relay_server, adapter_url):
         nonlocal connection_count
         connection_count += 1
         if connection_count == 1:
-            await ws.send(json.dumps({"type": "connected"}))
+            await ws.send(CONNECTED)
             await ws.close(code=1001, reason="going away")
         else:
             reconnected.set()
@@ -556,7 +594,7 @@ async def test_abnormal_closure_reconnects(make_relay_server, adapter_url):
         nonlocal connection_count
         connection_count += 1
         if connection_count == 1:
-            await ws.send(json.dumps({"type": "connected"}))
+            await ws.send(CONNECTED)
             ws.transport.abort()  # sever TCP with no close frame -> client sees 1006
         else:
             reconnected.set()
@@ -619,12 +657,12 @@ async def _response_after_reconnect(
     async def relay(ws):
         nonlocal connection_count
         connection_count += 1
-        await ws.send(json.dumps({"type": "connected"}))
+        await ws.send(CONNECTED)
         if connection_count == 1:
             await ws.send(json.dumps(request_frame("req-1")))
             ws.transport.abort()
         else:
-            received.set_result(json.loads(await ws.recv()))
+            received.set_result(await recv_response(ws))
             await ws.recv()
 
     url = await make_relay_server(relay)
@@ -670,13 +708,140 @@ async def test_held_response_past_its_deadline_is_dropped():
     now = time.monotonic()
     expired = {"type": "response", "request_id": "old", "payload": {"status": 200}}
     fresh = {"type": "response", "request_id": "new", "payload": {"status": 200}}
-    client._outbox = [(now - 1, expired), (now + 60, fresh)]
-    client._ws = ws = _Ws()
+    client._unacked = {"old": (now - 1, expired), "new": (now + 60, fresh)}
+    ws = _Ws()
 
-    await client._flush_outbox()
+    await client._resend_unacked(ws)
 
     assert [frame["request_id"] for frame in ws.sent] == ["new"]
-    assert client._outbox == []
+    # kept until acked
+    assert list(client._unacked) == ["new"]
+
+
+# ── Acks ──────────────────────────────────────────────────────────────────────
+
+
+def _counting_completion_app(delay: float = 0.0):
+    """A slow completion app that records every request it serves."""
+    calls: list[dict] = []
+    slow = _slow_completion_app(delay)
+
+    async def app(scope, receive, send):
+        if scope["type"] == "http":
+            calls.append(scope)
+        await slow(scope, receive, send)
+
+    return app, calls
+
+
+async def test_request_is_acked_before_it_is_answered(
+    make_relay_server, make_asgi_server
+):
+    """The client acks a request frame on receipt, ahead of its response."""
+    frames: list[dict] = []
+    done = asyncio.Event()
+
+    async def relay(ws):
+        await ws.send(CONNECTED)
+        await ws.send(json.dumps(request_frame("req-1")))
+        while len(frames) < 2:
+            frames.append(json.loads(await ws.recv()))
+        done.set()
+        await ws.recv()
+
+    url = await make_relay_server(relay)
+    slow_url = make_asgi_server(_slow_completion_app(0.2))
+    async with running_client(_client(url, slow_url)):
+        await asyncio.wait_for(done.wait(), timeout=10)
+
+    assert frames[0] == {"type": "ack", "request_id": "req-1"}
+    assert frames[1]["type"] == "response"
+
+
+async def _responses_across_reconnect(
+    make_relay_server, adapter_url, *, ack: bool
+) -> list[dict]:
+    """
+    On a first connection, send a request and receive its response, acking it
+    or not, then sever the connection. Return the frames the client sends on
+    the second connection, within a short window.
+    """
+    connection_count = 0
+    second: list[dict] = []
+    done = asyncio.Event()
+
+    async def relay(ws):
+        nonlocal connection_count
+        connection_count += 1
+        await ws.send(CONNECTED)
+        if connection_count == 1:
+            await ws.send(json.dumps(request_frame("req-1")))
+            await recv_response(ws)
+            if ack:
+                await ws.send(json.dumps({"type": "ack", "request_id": "req-1"}))
+                # let the client read the ack before the connection goes
+                await asyncio.sleep(0.1)
+            ws.transport.abort()
+        else:
+            try:
+                while True:
+                    second.append(json.loads(await asyncio.wait_for(ws.recv(), 0.5)))
+            except TimeoutError:
+                done.set()
+            await ws.recv()
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter_url)):
+        await asyncio.wait_for(done.wait(), timeout=10)
+    return second
+
+
+async def test_unacked_response_is_resent_after_reconnect(
+    make_relay_server, adapter_url
+):
+    """A response sent fine, but never acked, may have been lost in transit: it
+    is sent again on the next connection."""
+    second = await _responses_across_reconnect(
+        make_relay_server, adapter_url, ack=False
+    )
+    assert [(f["type"], f["request_id"]) for f in second] == [("response", "req-1")]
+
+
+async def test_acked_response_is_not_resent_after_reconnect(
+    make_relay_server, adapter_url
+):
+    second = await _responses_across_reconnect(make_relay_server, adapter_url, ack=True)
+    assert second == []
+
+
+async def test_request_received_again_reaches_adapter_once(
+    make_relay_server, make_asgi_server
+):
+    """A request sent again while still being handled, and once answered but
+    before the response is acked, is acked each time but forwarded only once;
+    the second time, the response is sent again."""
+    app, calls = _counting_completion_app(0.3)
+    adapter = make_asgi_server(app)
+    frames: list[dict] = []
+    done = asyncio.Event()
+
+    async def relay(ws):
+        await ws.send(CONNECTED)
+        await ws.send(json.dumps(request_frame("req-1")))
+        await ws.send(json.dumps(request_frame("req-1")))  # still in flight
+        frames.append(await recv_response(ws))
+        await ws.send(json.dumps(request_frame("req-1")))  # answered, not acked
+        frames.append(await recv_response(ws))
+        done.set()
+        await ws.recv()
+
+    url = await make_relay_server(relay)
+    async with running_client(_client(url, adapter)):
+        await asyncio.wait_for(done.wait(), timeout=10)
+
+    assert len(calls) == 1
+    assert [f["request_id"] for f in frames] == ["req-1", "req-1"]
+    assert frames[0] == frames[1]
 
 
 # ── Reconnect backoff ─────────────────────────────────────────────────────────
@@ -791,12 +956,12 @@ async def test_generous_request_timeout_allows_slow_adapter(
 
 async def test_payload_too_big_stops_client(make_relay_server):
     """A frame larger than max_ws_message_bytes → PayloadTooBig → run() returns."""
-    # The "connected" frame is ~23 bytes; the limit must admit it but reject the
+    # The "connected" frame is ~37 bytes; the limit must admit it but reject the
     # 100-byte oversized frame that follows.
     max_bytes = 50
 
     async def relay(ws):
-        await ws.send(json.dumps({"type": "connected"}))
+        await ws.send(CONNECTED)
         await ws.send("x" * 100)  # exceeds max_ws_message_bytes
         await ws.recv()
 

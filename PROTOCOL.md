@@ -134,25 +134,33 @@ Pass the API key as a header during the WebSocket handshake:
 Authorization: Bearer <api-key>
 ```
 
+and the protocol version it speaks, currently `2`:
+
+```
+Spectral-Bridge-Protocol: 2
+```
+
 A **conforming** relay client must use TLS (`wss://`). Plain `ws://` is not permitted for conforming deployments.
 
 Reference implementations may support plain `ws://` when the operator explicitly opts in (for example a `--insecure-relay` flag). That mode is for local development and debugging only; it is not conforming and must not be used where the relay traffic could leave a trusted network.
 
 Similarly, reference clients reach the adapter over loopback only: they reject an `adapter_url` whose host is not a loopback address (`localhost`, `127.0.0.0/8`, or `::1`). An explicit opt-out (for example an `--insecure-adapter` flag) may allow a non-loopback adapter for development, mirroring `--insecure-relay`; like that mode it is not intended for deployments where the adapter traffic could leave a trusted network.
 
-On successful authentication, the server sends a confirmation frame before any request frames:
+On successful authentication, the server sends a confirmation frame before any request frames, echoing the protocol version:
 
 ```json
-{ "type": "connected" }
+{ "type": "connected", "protocol": 2 }
 ```
 
 The client should surface this to the user (e.g. print to terminal).
 
 If authentication fails, the server closes the connection with code `4001`. The client must not retry with the same key without user intervention.
 
+If the client's protocol version is missing or not one the server speaks, the server closes the connection with code `4002`. Versions are not negotiated: client and server must speak the same one, and the client must be upgraded (or downgraded) to connect. Like `4001`, the client must not retry without user intervention.
+
 ### 2.2 Message Format
 
-All WebSocket frames carry UTF-8 encoded JSON. Two message types are defined.
+All WebSocket frames carry UTF-8 encoded JSON. Three message types are defined: `request`, `response` and `ack`.
 
 #### Inbound: Request frame (server → client)
 
@@ -205,6 +213,22 @@ If the client cannot forward the request to the local adapter (e.g. adapter is d
 }
 ```
 
+#### Ack frame (both directions)
+
+```json
+{
+  "type": "ack",
+  "request_id": "<opaque string>"
+}
+```
+
+An ack is a receipt: it tells the sender a frame reached the other side, so it need not be sent again (see §2.5).
+
+- The client acks every **request** frame as soon as it receives it, before forwarding it to the adapter.
+- The server acks every **response** frame it receives, including one for a request it no longer tracks (e.g. already timed out), so the client stops resending it.
+
+An ack is sent on the sender's current connection, and is never itself acknowledged.
+
 ### 2.3 Concurrency
 
 The client must handle request frames concurrently. Upon receiving a request frame, the client should immediately dispatch it to the local adapter and begin listening for the next frame — not wait for the adapter to respond before reading again. Response frames may be sent back in any order; the `request_id` provides correlation.
@@ -229,7 +253,17 @@ Reconnection uses **truncated exponential backoff**:
 
 On reconnect, the client presents the same API key. The relay server resolves the key to the same tunnel identity — the caller's endpoint does not change between reconnects.
 
-**The client must not replay or resubmit requests that were in-flight at the time of disconnect.** Those requests are the relay server's responsibility to time out and report as errors to the caller.
+**A disconnect does not fail in-flight requests.** A request outlives the connection it was sent on, and its response may come back on a later one; only the relay server's timeout fails it. A frame sent just before a connection drops may never arrive, and the sender can't tell whether it did (TCP gives no receipt once the connection is gone), so each side keeps what it sent until it's acked, and sends it again after the reconnect:
+
+- **Client:** keeps each response until the server acks it, and after every reconnect sends again those not acked yet. It may drop a response once the relay server's timeout for it has passed.
+- **Server:** keeps each request the client hasn't acked, and after every reconnect sends it again.
+
+Both sides deduplicate by `request_id`, so a frame received twice has no further effect:
+
+- A request frame for a request the client is still handling is acked and ignored; one it has already answered (response not acked yet) is acked, and the response sent again. **The client must never forward the same request to the adapter twice.**
+- A response frame for a request the server has already completed is acked and ignored.
+
+**The client must not replay requests on its own**: it forwards a request only when a request frame asks for it.
 
 ## 3. Relay Server
 
@@ -239,10 +273,11 @@ Only the `/connect` WebSocket endpoint is mandatory — it is the protocol bound
 
 The server must expose a public WebSocket endpoint at `/connect`. On connection:
 
+- Read the `Spectral-Bridge-Protocol` header. If absent or not a supported version, accept the connection and close it with code `4002` (accepting first makes the code reach the client; a connection closed before being accepted is rejected with an HTTP error instead).
 - Read the `Authorization: Bearer <api-key>` header. If absent or invalid, close with code `4001`.
 - Validate the key. The same key must always authenticate to the same connection slot, regardless of how many times the client reconnects.
 - Register the active WebSocket connection.
-- Send a `{ "type": "connected" }` frame before any request frames.
+- Send a `{ "type": "connected", "protocol": <version> }` frame before any request frames.
 
 **Reconnection**
 
@@ -252,9 +287,10 @@ The server must expose a public WebSocket endpoint at `/connect`. On connection:
 **Request forwarding**
 
 - Push request frames to the active connection.
-- Await the corresponding response frame, matched by `request_id`.
+- Await the corresponding response frame, matched by `request_id`, across reconnects: a disconnect does not fail pending requests, and requests not acked yet are sent again on the next connection (§2.5).
+- Ack every response frame (§2.2).
 - If no active connection exists: return an error to the caller immediately (suggested: HTTP `503`).
-- If no response frame is received within **30 seconds**: time out and return an error to the caller (suggested: HTTP `504`).
+- If no response frame is received within the server's timeout: return an error to the caller (suggested: HTTP `504`). Completions can be long, so the timeout should be generous (the reference implementation uses **600 seconds**), and clients should keep their own adapter timeout at least as long.
 
 ### 3.2 Suggested: Simple scenario
 

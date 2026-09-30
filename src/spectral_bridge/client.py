@@ -28,6 +28,10 @@ from websockets.exceptions import (
 
 logger = logging.getLogger("spectral_bridge.client")
 
+# the protocol version spoken with the relay (PROTOCOL.md §2.1): not negotiated,
+# a relay speaking another one closes the connection with 4002
+PROTOCOL_VERSION = 2
+
 KEEPALIVE_INTERVAL = 30
 KEEPALIVE_TIMEOUT = 10
 
@@ -102,12 +106,13 @@ class RelayClient:
         self._max_ws_message_bytes = max_ws_message_bytes
         self._request_timeout = request_timeout
         self._http: httpx.AsyncClient | None = None
-        self._tasks: set[asyncio.Task] = set()
+        self._tasks: dict[str, asyncio.Task] = {}
         self._ws: ClientConnection | None = None
-        # responses that couldn't be sent, with the deadline past which the relay
-        # has given up on them: sent once reconnected, as the relay keeps
-        # waiting for them across connections
-        self._outbox: list[tuple[float, dict[str, Any]]] = []
+        # request_id -> (deadline, response frame), until the relay acks it: a
+        # response sent just before a disconnect may never arrive, so those not
+        # acked are sent again on every reconnect, until the deadline past which
+        # the relay has given up on them
+        self._unacked: dict[str, tuple[float, dict[str, Any]]] = {}
         self._validate_relay_url(insecure_relay)
         self._validate_adapter_url(insecure_adapter)
 
@@ -153,7 +158,7 @@ class RelayClient:
     async def _cancel_inflight_handlers(self) -> None:
         if not self._tasks:
             return
-        tasks = list(self._tasks)
+        tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -175,6 +180,14 @@ class RelayClient:
                     if exc.rcvd is not None and exc.rcvd.code == 4001:
                         logger.error("authentication failed")
                         return
+                    if exc.rcvd is not None and exc.rcvd.code == 4002:
+                        logger.error(
+                            "relay refused protocol version %d (%s), "
+                            "upgrade spectral-bridge",
+                            PROTOCOL_VERSION,
+                            exc.rcvd.reason,
+                        )
+                        return
                     sent_1009 = exc.sent is not None and exc.sent.code == 1009
                     rcvd_1009 = exc.rcvd is not None and exc.rcvd.code == 1009
                     if sent_1009 or rcvd_1009:
@@ -184,6 +197,13 @@ class RelayClient:
                         )
                         return
                     reason = str(exc)
+                except _UnsupportedRelay as exc:
+                    logger.error(
+                        "relay speaks protocol version %s, expected %d",
+                        exc.version,
+                        PROTOCOL_VERSION,
+                    )
+                    return
                 except InvalidStatus as exc:
                     if exc.response.status_code in (401, 403):
                         logger.error("authentication failed")
@@ -210,7 +230,10 @@ class RelayClient:
                 self._http = None
 
     async def _connect(self) -> None:
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Spectral-Bridge-Protocol": str(PROTOCOL_VERSION),
+        }
         async with websockets.connect(
             self.relay_url,
             additional_headers=headers,
@@ -223,11 +246,13 @@ class RelayClient:
             msg = json.loads(raw)
             if msg.get("type") != "connected":
                 raise ProtocolError(f"unexpected first frame: {msg}")
+            if msg.get("protocol") != PROTOCOL_VERSION:
+                raise _UnsupportedRelay(msg.get("protocol"))
             logger.info("connected to relay")
 
             self._ws = ws
             try:
-                await self._flush_outbox()
+                await self._resend_unacked(ws)
                 await self._listen(ws)
             finally:
                 self._ws = None
@@ -237,53 +262,54 @@ class RelayClient:
             data = json.loads(raw)
             msg_type = data.get("type")
             if msg_type == "request":
-                task = asyncio.create_task(
-                    self._handle_request(data["request_id"], data["payload"])
-                )
-                self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
+                await self._on_request(ws, data["request_id"], data["payload"])
+            elif msg_type == "ack":
+                self._unacked.pop(data["request_id"], None)
             else:
                 logger.warning("unknown frame type=%s", msg_type)
 
-    async def _send_or_hold_response(
-        self, request_id: str, payload: dict[str, Any], deadline: float
-    ) -> bool:
-        frame = {"type": "response", "request_id": request_id, "payload": payload}
-        ws = self._ws
-        if ws is not None:
-            try:
-                await ws.send(json.dumps(frame))
-                return True
-            except ConnectionClosed:
-                pass
+    async def _on_request(
+        self, ws: ClientConnection, request_id: str, payload: dict[str, Any]
+    ) -> None:
+        await _send(ws, {"type": "ack", "request_id": request_id})
 
-        # response frame couldn't be sent, keep it for retry
-        logger.info("relay disconnected, holding response for %s", request_id)
-        self._outbox.append((deadline, frame))
-        return False
+        if request_id in self._tasks:
+            # a request received again must never reach the adapter twice
+            return
 
-    async def _flush_outbox(self) -> None:
-        """Send the responses held while disconnected, over the current connection."""
-        outbox, self._outbox = self._outbox, []
-        sent = 0
-        for deadline, frame in outbox:
-            if time.monotonic() > deadline:
-                logger.warning(
-                    "dropped response for %s, relay reconnected too late",
-                    frame["request_id"],
-                )
-                continue
-            sent += await self._send_or_hold_response(
-                frame["request_id"], frame["payload"], deadline
-            )
-        if sent:
-            logger.info("sent %d held responses", sent)
+        if request_id in self._unacked:
+            # answered already, but the response may have been lost too
+            await _send(ws, self._unacked[request_id][1])
+            return
+
+        task = asyncio.create_task(self._handle_request(request_id, payload))
+        self._tasks[request_id] = task
+        task.add_done_callback(lambda _: self._tasks.pop(request_id, None))
 
     async def _handle_request(self, request_id: str, payload: dict[str, Any]) -> None:
         # past this, the relay stops waiting for the response
         deadline = time.monotonic() + self._request_timeout
         response = await self._call_adapter(request_id, payload)
-        await self._send_or_hold_response(request_id, response, deadline)
+        frame = {"type": "response", "request_id": request_id, "payload": response}
+        self._unacked[request_id] = (deadline, frame)
+        ws = self._ws
+        if ws is None or not await _send(ws, frame):
+            logger.info("relay disconnected, holding response for %s", request_id)
+
+    async def _resend_unacked(self, ws: ClientConnection) -> None:
+        resent = 0
+        for request_id, (deadline, frame) in list(self._unacked.items()):
+            if time.monotonic() > deadline:
+                self._unacked.pop(request_id, None)
+                logger.warning(
+                    "dropped response for %s, relay reconnected too late", request_id
+                )
+                continue
+            if not await _send(ws, frame):
+                break
+            resent += 1
+        if resent:
+            logger.info("resent %d unacked responses", resent)
 
     async def _call_adapter(
         self, request_id: str, payload: dict[str, Any]
@@ -321,6 +347,22 @@ class RelayClient:
             "headers": {"content-type": "application/json"},
             "body": response_body,
         }
+
+
+class _UnsupportedRelay(Exception):
+    """The relay speaks another protocol version."""
+
+    def __init__(self, version: object) -> None:
+        super().__init__(f"relay speaks protocol version {version}")
+        self.version = version
+
+
+async def _send(ws: ClientConnection, frame: dict[str, Any]) -> bool:
+    try:
+        await ws.send(json.dumps(frame))
+    except ConnectionClosed:
+        return False
+    return True
 
 
 def _for_log(value: object) -> str:
