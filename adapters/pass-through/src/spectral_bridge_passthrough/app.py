@@ -20,6 +20,17 @@ from pydantic import BaseModel, ConfigDict
 
 log = logging.getLogger(__name__)
 
+# logged bodies are truncated: they are unbounded and may echo request content
+MAX_LOG_BODY_CHARS = 1024
+
+
+def _for_log(value: object) -> str:
+    text = str(value)
+    extra = len(text) - MAX_LOG_BODY_CHARS
+    if extra > 0:
+        return f"{text[:MAX_LOG_BODY_CHARS]}... ({extra} chars truncated)"
+    return text
+
 TARGET_URL = os.environ.get("TARGET_URL", "").rstrip("/")
 
 _HOP_BY_HOP_HEADERS = frozenset(
@@ -77,7 +88,7 @@ app = FastAPI(title="spectral-bridge pass-through adapter", lifespan=lifespan)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    log.warning("request validation failed: %s", exc.errors())
+    log.warning("request validation failed: %s", _for_log(exc.errors()))
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
@@ -108,7 +119,7 @@ async def _forward(path: str, body: BaseModel, request: Request) -> JSONResponse
         content = {"error": {"message": resp.text}}
 
     if resp.status_code >= 400:
-        log.warning("target returned %s: %s", resp.status_code, content)
+        log.warning("target returned %s: %s", resp.status_code, _for_log(content))
 
     return JSONResponse(status_code=resp.status_code, content=content)
 

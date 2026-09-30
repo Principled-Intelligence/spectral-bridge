@@ -12,22 +12,46 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import signal
 import subprocess
 import sys
+import threading
 import time
+from typing import IO
 
 import click
 import httpx
 from rich.logging import RichHandler
+from rich.text import Text
 
+from spectral_bridge.cli.defaults import SPECTRAL_RELAY_URL
 from spectral_bridge.client import (
     DEFAULT_MAX_WS_MESSAGE_BYTES,
     DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SHUTDOWN_GRACE,
     RelayClient,
 )
-from spectral_bridge.cli.defaults import SPECTRAL_RELAY_URL
 
 logger = logging.getLogger("spectral_bridge.cli")
+adapter_logger = logging.getLogger("spectral_bridge.adapter")
+
+# uvicorn's default log format: "WARNING:  message"
+_UVICORN_LEVEL_PREFIX = re.compile(r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL):\s+")
+
+
+class _SourceRichHandler(RichHandler):
+    """Prefix each log line with where it comes from, docker-compose style."""
+
+    def render_message(self, record: logging.LogRecord, message: str) -> Text:
+        if record.name == adapter_logger.name:
+            source, style = "adapter", "magenta"
+        else:
+            source, style = "bridge", "cyan"
+        return Text.assemble(
+            (f"{source:<7} | ", style), super().render_message(record, message)
+        )
+
 
 API_KEY_ENV = "SPECTRAL_BRIDGE_API_KEY"
 
@@ -53,9 +77,8 @@ def _wait_for_adapter(url: str, proc: subprocess.Popen, timeout: float = 10.0) -
     while time.monotonic() < deadline:
         ret = proc.poll()
         if ret is not None:
-            stderr = proc.stderr.read() if proc.stderr else ""
             raise click.ClickException(
-                f"adapter process exited with code {ret}\n{stderr}"
+                f"adapter process exited with code {ret}, see its logs above"
             )
         try:
             r = httpx.get(f"{url}/health", timeout=2)
@@ -88,10 +111,43 @@ def _spawn_adapter(adapter: str, target: str, port: int) -> subprocess.Popen:
             "warning",
         ],
         env=env,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
     )
+    # the pipe must be drained for the adapter's whole life: once full (~64 KiB)
+    # the adapter blocks on its next log write
+    threading.Thread(
+        target=_relog_adapter_output, args=(proc.stdout,), daemon=True
+    ).start()
     return proc
+
+
+def _relog_adapter_output(stream: IO[str]) -> None:
+    """Re-log each line the adapter prints, under the adapter's logger."""
+    # unprefixed lines (e.g. traceback frames) keep the previous line's level
+    level = logging.WARNING
+    for line in stream:
+        line = line.rstrip()
+        if not line:
+            continue
+        match = _UVICORN_LEVEL_PREFIX.match(line)
+        if match:
+            level = getattr(logging, match[1])
+            line = line[match.end() :]
+        adapter_logger.log(level, "%s", line)
+
+
+async def _run_until_stopped(client: RelayClient) -> None:
+    """Run the client until a shutdown signal has drained it."""
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, client.shutdown)
+        except NotImplementedError:
+            break
+    await client.run()
 
 
 @click.group()
@@ -101,7 +157,7 @@ def cli() -> None:
         level=logging.INFO,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(show_path=False, markup=False)],
+        handlers=[_SourceRichHandler(show_path=False, markup=False)],
     )
 
 
@@ -146,6 +202,14 @@ def cli() -> None:
     "(default is matched to the Spectral relay; on another platform keep "
     "it >= that relay's server-side timeout)",
 )
+@click.option(
+    "--shutdown-grace",
+    type=click.FloatRange(min=0),
+    default=DEFAULT_SHUTDOWN_GRACE,
+    show_default=True,
+    help="On shutdown (SIGTERM, Ctrl+C), max seconds to let in-flight requests "
+    "finish before closing; a second signal stops at once",
+)
 def start_relay(
     relay_url: str,
     adapter_url: str,
@@ -153,6 +217,7 @@ def start_relay(
     insecure_adapter: bool,
     max_ws_message_bytes: int,
     request_timeout: float,
+    shutdown_grace: float,
 ) -> None:
     """Connect the relay client to an already-running adapter."""
     relay_url = relay_url.strip()
@@ -166,11 +231,12 @@ def start_relay(
             insecure_adapter=insecure_adapter,
             max_ws_message_bytes=max_ws_message_bytes,
             request_timeout=request_timeout,
+            shutdown_grace=shutdown_grace,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     try:
-        asyncio.run(client.run())
+        asyncio.run(_run_until_stopped(client))
     except KeyboardInterrupt:
         logger.info("shutting down")
 
@@ -215,6 +281,14 @@ def start_relay(
     "(default is matched to the Spectral relay; on another platform keep "
     "it >= that relay's server-side timeout)",
 )
+@click.option(
+    "--shutdown-grace",
+    type=click.FloatRange(min=0),
+    default=DEFAULT_SHUTDOWN_GRACE,
+    show_default=True,
+    help="On shutdown (SIGTERM, Ctrl+C), max seconds to let in-flight requests "
+    "finish before closing; a second signal stops at once",
+)
 def start(
     relay_url: str,
     adapter: str,
@@ -223,6 +297,7 @@ def start(
     insecure_relay: bool,
     max_ws_message_bytes: int,
     request_timeout: float,
+    shutdown_grace: float,
 ) -> None:
     """Start a built-in adapter and connect the relay client."""
     relay_url = relay_url.strip()
@@ -251,6 +326,7 @@ def start(
             insecure_relay=insecure_relay,
             max_ws_message_bytes=max_ws_message_bytes,
             request_timeout=request_timeout,
+            shutdown_grace=shutdown_grace,
         )
     except ValueError as exc:
         proc.terminate()
@@ -258,7 +334,7 @@ def start(
         raise click.ClickException(str(exc)) from exc
 
     try:
-        asyncio.run(client.run())
+        asyncio.run(_run_until_stopped(client))
     except KeyboardInterrupt:
         logger.info("shutting down")
     finally:

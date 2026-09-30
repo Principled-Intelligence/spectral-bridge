@@ -5,6 +5,11 @@ from click.testing import CliRunner
 from spectral_bridge.cli.main import cli
 
 
+def _close(coro):
+    """Stand-in for asyncio.run: close the coroutine instead of running it."""
+    coro.close()
+
+
 def test_start_relay_rejects_non_loopback_adapter(monkeypatch):
     monkeypatch.setenv("SPECTRAL_BRIDGE_API_KEY", "key")
     result = CliRunner().invoke(
@@ -51,7 +56,7 @@ def test_start_relay_defaults_to_spectral_relay(monkeypatch):
     monkeypatch.setenv("SPECTRAL_BRIDGE_API_KEY", "key")
     monkeypatch.delenv("SPECTRAL_BRIDGE_RELAY_URL", raising=False)
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ):
         result = CliRunner().invoke(
             cli,
@@ -67,7 +72,7 @@ def test_start_relay_env_var_overrides_default(monkeypatch):
         "SPECTRAL_BRIDGE_RELAY_URL", "wss://other-platform.example.com/connect"
     )
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ):
         result = CliRunner().invoke(
             cli,
@@ -83,7 +88,7 @@ def test_start_relay_flag_overrides_env_var(monkeypatch):
         "SPECTRAL_BRIDGE_RELAY_URL", "wss://other-platform.example.com/connect"
     )
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ):
         result = CliRunner().invoke(
             cli,
@@ -105,7 +110,7 @@ def test_start_defaults_to_spectral_relay(monkeypatch):
     monkeypatch.setenv("SPECTRAL_BRIDGE_API_KEY", "key")
     monkeypatch.delenv("SPECTRAL_BRIDGE_RELAY_URL", raising=False)
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ), patch("spectral_bridge.cli.main._spawn_adapter") as fake_spawn, patch(
         "spectral_bridge.cli.main._wait_for_adapter"
     ):
@@ -124,7 +129,7 @@ def test_start_env_var_overrides_default(monkeypatch):
         "SPECTRAL_BRIDGE_RELAY_URL", "wss://other-platform.example.com/connect"
     )
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ), patch("spectral_bridge.cli.main._spawn_adapter"), patch(
         "spectral_bridge.cli.main._wait_for_adapter"
     ):
@@ -142,7 +147,7 @@ def test_start_flag_overrides_env_var(monkeypatch):
         "SPECTRAL_BRIDGE_RELAY_URL", "wss://other-platform.example.com/connect"
     )
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ), patch("spectral_bridge.cli.main._spawn_adapter"), patch(
         "spectral_bridge.cli.main._wait_for_adapter"
     ):
@@ -165,7 +170,7 @@ def test_start_flag_overrides_env_var(monkeypatch):
 def test_start_relay_strips_relay_url_whitespace(monkeypatch):
     monkeypatch.setenv("SPECTRAL_BRIDGE_API_KEY", "key")
     with patch("spectral_bridge.cli.main.RelayClient") as fake_client, patch(
-        "spectral_bridge.cli.main.asyncio.run"
+        "spectral_bridge.cli.main.asyncio.run", side_effect=_close
     ):
         result = CliRunner().invoke(
             cli,
