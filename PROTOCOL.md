@@ -12,15 +12,16 @@ Any conforming implementation of either client-facing component (adapter or rela
 
 ## 1. Adapter Contract
 
-An adapter is any process that **translates** a local target into an OpenAI-compatible HTTP server, acting as a semantic boundary: only the chatbot's text response is forwarded — no raw network traffic from the internal host crosses the boundary. The relay client forwards requests to it over localhost and expects responses in the format below.
+An adapter is any process that **translates** a local target into an OpenAI-compatible HTTP server, acting as a semantic boundary: no raw network traffic from the internal host crosses it. What does cross is what each endpoint forwards: the chat and Responses endpoints forward the AI system's response to the test prompt (and, for Responses, its tool calls), and `/v1/spectrograph` forwards the session's events, including tool arguments, sub-agent prompts and handoffs. The relay client forwards requests to it over localhost and expects responses in the format below.
 
 ### Required Endpoints
 
-An adapter implements one or both of the following, depending on the API it proxies. The relay client forwards each request to the endpoint named by the request frame's `path` field (see §2.2), defaulting to `/v1/chat/completions`.
+An adapter implements one or more of the following, depending on the API it proxies. The relay client forwards each request to the endpoint named by the request frame's `path` field (see §2.2), defaulting to `/v1/chat/completions`.
 
 ```
 POST /v1/chat/completions   (Chat Completions API)
 POST /v1/responses          (OpenAI Responses API)
+POST /v1/spectrograph       (session events, see "Spectrograph endpoint")
 ```
 
 No other endpoints are required. An adapter that proxies only one API need only implement that endpoint.
@@ -116,6 +117,47 @@ Additional fields (`id`, `usage`, `status`, etc.) are optional and passed throug
 
 **Non-streaming.** The Responses path is non-streaming end to end: the adapter buffers a single JSON response. A `stream: true` request is not supported.
 
+### Spectrograph endpoint
+
+For targets whose instrumentation can report the whole session (tools, sub-agents, handoffs), the adapter implements:
+
+```
+POST /v1/spectrograph
+```
+
+The events are spectrograph's wire events. This document does not specify their format.
+
+**Request format.** One request per simulated turn:
+
+```json
+{
+  "conversation_id": "string, fresh per conversation, the same on every turn of it",
+  "execution_id": "string, for correlation",
+  "turn": 1,
+  "input": "the persona's message"
+}
+```
+
+`turn` is 1-based. When Spectral ends the conversation it sends one more request, the end request, with the next turn number, `end: true` and no `input`:
+
+```json
+{ "conversation_id": "string", "execution_id": "string", "turn": 4, "end": true }
+```
+
+**Response format.** The adapter returns only that turn's events, in order:
+
+```json
+{ "events": [ ] }
+```
+
+On turn 1 the events start with `trace_opened`. The adapter appends the persona's message to the trace itself, as a user message equal to `input`. The events may end with `trace_closed(complete=True)` when the adapter knows the conversation is over. In reply to the end request, the adapter returns whatever is left (late receipts, settlements) and should end it with `trace_closed(complete=True)`.
+
+After a `trace_closed(complete=True)`, Spectral sends no further request for that conversation.
+
+An adapter **should** answer a repeated `(conversation_id, turn)` with the events it already returned.
+
+**Error responses.** As with the other endpoints, failures return a standard `4xx`/`5xx` status with `{"error": {"message": "..."}}`.
+
 ## 2. Relay Client Protocol
 
 The relay client maintains a persistent, bidirectional WebSocket connection to the relay server. The connection is **initiated outbound** by the client — no inbound ports or firewall rules are required. Once established, the server pushes request frames down to the client, and the client pushes response frames back up.
@@ -181,7 +223,7 @@ A frame is at most **16 MiB** (16,777,216 bytes). A larger one makes the receive
 
 `request_id` is assigned by the relay server. It is opaque to the client — treat it as a correlation token and echo it back unchanged in the response.
 
-`path` names the adapter endpoint the request targets. The client accepts only the protocol-defined endpoints — `/v1/chat/completions` and `/v1/responses` — matched exactly, and forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions`. Any other `path` value is rejected: the client sends a `404` error response frame and makes no request to the adapter. This prevents a relay-supplied path from redirecting the request off the configured loopback adapter.
+`path` names the adapter endpoint the request targets. The client accepts only the protocol-defined endpoints — `/v1/chat/completions`, `/v1/responses` and `/v1/spectrograph` — matched exactly, and forwards the request to `{adapter_url}{path}`. When `path` is absent, the client defaults to `/v1/chat/completions`. Any other `path` value is rejected: the client sends a `404` error response frame and makes no request to the adapter. This prevents a relay-supplied path from redirecting the request off the configured loopback adapter.
 
 #### Outbound: Response frame (client → server)
 

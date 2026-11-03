@@ -547,6 +547,86 @@ async def test_frame_path_forwarded_to_adapter(make_relay_server, make_asgi_serv
     assert recorder == ["/v1/responses"]
 
 
+def _echo_events_app(events: list):
+    """ASGI app answering POST /v1/spectrograph with {"events": events}."""
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        if scope["path"] != "/v1/spectrograph":
+            status, body = 404, b'{"error": {"message": "not found"}}'
+        else:
+            status = 200
+            body = json.dumps({"events": events}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    return app
+
+
+async def test_spectrograph_frame_path_forwarded_to_adapter(
+    make_relay_server, make_asgi_server
+):
+    recorder: list = []
+    target_url = make_asgi_server(_path_recording_app(recorder))
+    frame = {
+        "type": "request",
+        "request_id": "sg-1",
+        "payload": {
+            "method": "POST",
+            "path": "/v1/spectrograph",
+            "headers": {},
+            "body": {"conversation_id": "c1", "turn": 1, "input": "hi"},
+        },
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["status"] == 200
+    assert recorder == ["/v1/spectrograph"]
+
+
+async def test_spectrograph_events_survive_the_round_trip_unchanged(
+    make_relay_server, make_asgi_server
+):
+    events = [
+        {"event": "trace_opened", "initial_surface": "/root", "observes": ["content"]},
+        {
+            "event": "item_appended",
+            "path": "/root",
+            "item": {
+                "item": "dispatch",
+                "target": "tool:x",
+                "call_id": "c1",
+                "mode": "sync",
+                "transfer": False,
+                "args": {"q": "café ✓", "n": None, "big": 2**53 + 1},
+            },
+        },
+    ]
+    target_url = make_asgi_server(_echo_events_app(events))
+    frame = {
+        "type": "request",
+        "request_id": "sg-2",
+        "payload": {
+            "method": "POST",
+            "path": "/v1/spectrograph",
+            "headers": {},
+            "body": {"conversation_id": "c1", "turn": 2, "end": True},
+        },
+    }
+    response = await _drive_one_frame(make_relay_server, target_url, frame)
+    assert response["payload"]["body"] == {"events": events}
+
+
 async def test_absent_frame_path_defaults_to_chat(make_relay_server, make_asgi_server):
     """A frame with no path field still forwards to /v1/chat/completions."""
     recorder: list = []

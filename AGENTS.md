@@ -15,7 +15,7 @@ Local adapter → Internal target
 ```
 
 - **Relay client** (`src/spectral_bridge/`): outbound WebSocket connection to relay server, forwards requests to a local adapter
-- **Adapters** (`adapters/`): translate any local target into OpenAI-compatible endpoints — `POST /v1/chat/completions` and/or `POST /v1/responses` (the relay client forwards each request to the endpoint it names)
+- **Adapters** (`adapters/`): translate any local target into OpenAI-compatible endpoints — `POST /v1/chat/completions` and/or `POST /v1/responses` — or serve `POST /v1/spectrograph` (session events, PROTOCOL.md "Spectrograph endpoint") (the relay client forwards each request to the endpoint it names)
 
 See `PROTOCOL.md` for the full spec.
 
