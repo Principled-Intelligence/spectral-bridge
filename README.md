@@ -33,7 +33,7 @@ The core problem is asymmetric: testing platforms need to *initiate* requests, b
 
 **Server.** The relay server is the testing platform's responsibility.
 
-**Security boundary.** The relay does not give the testing platform access to your network. Traffic terminates at the adapter — a small process you control that exposes only OpenAI-compatible endpoints. Nothing else is forwarded.
+**Security boundary.** The relay does not give the testing platform access to your network. Traffic terminates at the adapter — a small process you control that exposes only the protocol's adapter endpoints (see above for what each one forwards). Nothing else is forwarded.
 
 ## Quickstart
 
@@ -77,7 +77,7 @@ docker run -d --restart always --read-only --cap-drop ALL \
 
 ## Adapters
 
-An adapter is a thin translation layer that sits between `spectral-bridge` and your AI system. It serves standard OpenAI-compatible endpoints — `POST /v1/chat/completions` (Chat Completions API) and/or `POST /v1/responses` (Responses API) — using standard OpenAI request and response shapes. An adapter can implement either or both; the relay client forwards each request to the endpoint it names.
+An adapter is a thin translation layer that sits between `spectral-bridge` and your AI system. It serves `POST /v1/chat/completions` (Chat Completions API) and/or `POST /v1/responses` (Responses API), using standard OpenAI request and response shapes, or `POST /v1/spectrograph` (session events, see the protocol). An adapter can implement any of them; the relay client forwards each request to the endpoint it names.
 
 Adapters can be written in any language. Any process, container, or script that serves one of those endpoints qualifies.
 

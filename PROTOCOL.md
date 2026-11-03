@@ -12,7 +12,7 @@ Any conforming implementation of either client-facing component (adapter or rela
 
 ## 1. Adapter Contract
 
-An adapter is any process that **translates** a local target into an OpenAI-compatible HTTP server, acting as a semantic boundary: no raw network traffic from the internal host crosses it. What does cross is what each endpoint forwards: the chat and Responses endpoints forward the AI system's response to the test prompt (and, for Responses, its tool calls), and `/v1/spectrograph` forwards the session's events, including tool arguments, sub-agent prompts and handoffs. The relay client forwards requests to it over localhost and expects responses in the format below.
+An adapter is any process that **translates** a local target into an OpenAI-compatible HTTP server (or one that serves `POST /v1/spectrograph`), acting as a semantic boundary: no raw network traffic from the internal host crosses it. What does cross is what each endpoint forwards: the chat and Responses endpoints forward the AI system's response to the test prompt (and, for Responses, its tool calls), and `/v1/spectrograph` forwards the session's events, including tool arguments, sub-agent prompts and handoffs. The relay client forwards requests to it over localhost and expects responses in the format below.
 
 ### Required Endpoints
 
