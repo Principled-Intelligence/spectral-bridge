@@ -436,6 +436,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "spectral-bridge-adapter-pass-through" },
+    { name = "spectral-bridge-adapter-playback" },
     { name = "ty" },
 ]
 
@@ -454,6 +455,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "spectral-bridge-adapter-pass-through", editable = "adapters/pass-through" },
+    { name = "spectral-bridge-adapter-playback", editable = "adapters/playback" },
     { name = "ty", specifier = "==0.0.1a23" },
 ]
 
@@ -470,6 +472,20 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.135.2" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "uvicorn", specifier = ">=0.42" },
+]
+
+[[package]]
+name = "spectral-bridge-adapter-playback"
+source = { editable = "adapters/playback" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.135.2" },
     { name = "uvicorn", specifier = ">=0.42" },
 ]
 

@@ -27,6 +27,7 @@ src/spectral_bridge/     # Relay client SDK and CLI
   cli/                   # `spectral-bridge start` entrypoint
 adapters/                # Each adapter is self-contained (any language)
   pass-through/          # Proxy for local OpenAI-compatible endpoints
+  playback/              # Test adapter serving recorded spectrograph events (not in the CLI's ADAPTERS)
 PROTOCOL.md              # Relay protocol and adapter contract spec
 ```
 

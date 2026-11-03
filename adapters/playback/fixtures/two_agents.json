@@ -1,0 +1,73 @@
+{
+  "turns": [
+    [
+      {
+        "event": "trace_opened",
+        "initial_surface": "/root",
+        "observes": ["content", "counterparty", "status", "ts"]
+      },
+      {
+        "event": "node_opened",
+        "path": "/root",
+        "kind": "agent",
+        "config": {"tools_available": {"static": [], "dynamic_sources": [], "exact": true}}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "message", "role": "user", "content": "(replaced by the persona)", "counterparty": "external", "ts": "2026-11-03T09:00:00Z"}
+      },
+      {
+        "event": "node_opened",
+        "path": "/root/researcher",
+        "kind": "agent",
+        "config": {"tools_available": {"static": [], "dynamic_sources": [], "exact": true}}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "dispatch", "target": "/root/researcher", "call_id": "call-1", "mode": "sync", "transfer": false, "args": {"question": "background"}, "ts": "2026-11-03T09:00:01Z"}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root/researcher",
+        "item": {"item": "message", "role": "assistant", "content": "Here is the background.", "ts": "2026-11-03T09:00:02Z"}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "receipt", "source": "/root/researcher", "call_id": "call-1", "seq": 1,"ts": "2026-11-03T09:00:03Z"}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "message", "role": "assistant", "content": "Here is what I found. Anything else?", "counterparty": "external", "ts": "2026-11-03T09:00:04Z"}
+      }
+    ],
+    [
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "message", "role": "user", "content": "(replaced by the persona)", "counterparty": "external", "ts": "2026-11-03T09:01:00Z"}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "dispatch", "target": "tool:lookup", "call_id": "call-2", "mode": "sync", "transfer": false, "args": {"query": "details"}, "ts": "2026-11-03T09:01:01Z"}
+      },
+      {
+        "event": "item_appended",
+        "path": "/root",
+        "item": {"item": "message", "role": "assistant", "content": "Looking that up now.", "counterparty": "external", "ts": "2026-11-03T09:01:02Z"}
+      }
+    ]
+  ],
+  "end": [
+    {
+      "event": "item_appended",
+      "path": "/root",
+      "item": {"item": "receipt", "source": "tool:lookup", "call_id": "call-2", "seq": 1,"ts": "2026-11-03T09:01:03Z"}
+    },
+    {"event": "trace_closed", "complete": true}
+  ]
+}
