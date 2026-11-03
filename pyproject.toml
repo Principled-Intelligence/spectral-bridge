@@ -21,7 +21,6 @@ pass-through = ["spectral-bridge-adapter-pass-through"]
 
 [tool.uv.sources]
 spectral-bridge-adapter-pass-through = { path = "adapters/pass-through", editable = true }
-spectral-bridge-adapter-playback = { path = "adapters/playback", editable = true }
 
 [project.scripts]
 spectral-bridge = "spectral_bridge.cli.main:cli"
@@ -32,12 +31,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "spectral-bridge-adapter-pass-through",
-    "spectral-bridge-adapter-playback",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "adapters/pass-through/tests", "adapters/playback/tests"]
+testpaths = ["tests", "adapters/pass-through/tests"]
 addopts = "--import-mode=importlib"
 
 [tool.hatch.version]

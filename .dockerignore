@@ -7,13 +7,9 @@
 !NOTICE
 !src
 !adapters/pass-through
-!adapters/playback
 !docker
 
 # Re-excluded from the allowed trees above.
 adapters/pass-through/dist
 adapters/pass-through/tests
-adapters/playback/dist
-adapters/playback/tests
-adapters/playback/fixtures
 **/__pycache__
