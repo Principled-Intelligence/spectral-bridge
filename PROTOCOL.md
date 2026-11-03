@@ -150,7 +150,7 @@ The events are spectrograph's wire events. This document does not specify their 
 { "events": [ ] }
 ```
 
-On turn 1 the events start with `trace_opened`. The adapter appends the persona's message to the trace itself, as a user message equal to `input`. The events may end with `trace_closed(complete=True)` when the adapter knows the conversation is over. In reply to the end request, the adapter returns whatever is left (late receipts, settlements) and should end it with `trace_closed(complete=True)`.
+On turn 1 the events start with `trace_opened`. The adapter appends the persona's message to the trace itself, as a user message equal to `input`. The events may end with `trace_closed(complete=True)` when the adapter knows the conversation is over. In reply to the end request, the adapter returns whatever is left (late receipts, settlements) and should end it with `trace_closed(complete=True)`, forced (`trace_closed(complete=True, force=True)`) if it has given up on something still pending: a forced close settles whatever is left to "unresolved". `force` is only valid together with `complete=True`.
 
 After a `trace_closed(complete=True)`, Spectral sends no further request for that conversation.
 

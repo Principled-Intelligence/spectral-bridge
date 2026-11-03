@@ -20,6 +20,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
 COPY src/ src/
 COPY adapters/pass-through/ adapters/pass-through/
+# Not installed in the image (--no-dev), but the lock records it as a path
+# source and `uv sync --locked` needs its metadata to validate the lock.
+COPY adapters/playback/ adapters/playback/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable --extra pass-through
