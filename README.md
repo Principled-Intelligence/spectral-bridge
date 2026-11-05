@@ -21,7 +21,7 @@ The core problem is asymmetric: testing platforms need to *initiate* requests, b
 - **Deploying a public proxy** means standing up and securing new infrastructure for every platform you want to use.
 - **Skipping external evaluation entirely** means flying blind on safety, capability, and regression testing.
 
-`spectral-bridge` replaces all of these with a single outbound WebSocket connection from inside your network to the testing platform's relay. Nothing inbound. No VPN sharing. No new public infrastructure. The only thing that crosses the boundary is the AI system's text response to a test prompt — nothing else on your network is reachable.
+`spectral-bridge` replaces all of these with a single outbound WebSocket connection from inside your network to the testing platform's relay. Nothing inbound. No VPN sharing. No new public infrastructure. What crosses the boundary depends on the endpoint your adapter serves: the chat and Responses endpoints forward the AI system's response to a test prompt (and, for Responses, its tool calls), and `/v1/spectrograph` forwards the session's events, including tool arguments, sub-agent prompts and handoffs. Nothing else on your network is reachable.
 
 ## How it works
 
@@ -33,7 +33,7 @@ The core problem is asymmetric: testing platforms need to *initiate* requests, b
 
 **Server.** The relay server is the testing platform's responsibility.
 
-**Security boundary.** The relay does not give the testing platform access to your network. Traffic terminates at the adapter — a small process you control that exposes only OpenAI-compatible endpoints. Nothing else is forwarded.
+**Security boundary.** The relay does not give the testing platform access to your network. Traffic terminates at the adapter — a small process you control that exposes only the protocol's adapter endpoints (see above for what each one forwards). Nothing else is forwarded.
 
 ## Quickstart
 
@@ -77,7 +77,7 @@ docker run -d --restart always --read-only --cap-drop ALL \
 
 ## Adapters
 
-An adapter is a thin translation layer that sits between `spectral-bridge` and your AI system. It serves standard OpenAI-compatible endpoints — `POST /v1/chat/completions` (Chat Completions API) and/or `POST /v1/responses` (Responses API) — using standard OpenAI request and response shapes. An adapter can implement either or both; the relay client forwards each request to the endpoint it names.
+An adapter is a thin translation layer that sits between `spectral-bridge` and your AI system. It serves `POST /v1/chat/completions` (Chat Completions API) and/or `POST /v1/responses` (Responses API), using standard OpenAI request and response shapes, or `POST /v1/spectrograph` (session events, see the protocol). An adapter can implement any of them; the relay client forwards each request to the endpoint it names.
 
 Adapters can be written in any language. Any process, container, or script that serves one of those endpoints qualifies.
 
@@ -87,7 +87,7 @@ The built-in [`pass-through`](https://github.com/Principled-Intelligence/spectra
 
 `spectral-bridge` is built on an open protocol so that any testing platform can integrate relay support. The protocol has three parts:
 
-1. **Adapter contract** — any process serving `POST /v1/chat/completions` and/or `POST /v1/responses` qualifies. Only the chatbot's text response crosses the network boundary; no raw traffic from the internal host is forwarded.
+1. **Adapter contract** — any process serving `POST /v1/chat/completions`, `POST /v1/responses` and/or `POST /v1/spectrograph` qualifies. The chat and Responses endpoints forward the AI system's response to the test prompt (and, for Responses, its tool calls); `/v1/spectrograph` forwards the session's events, including tool arguments, sub-agent prompts and handoffs. No raw traffic from the internal host is forwarded.
 
 2. **Relay client** — connects outbound to `wss://<relay-host>/connect` with bearer auth. The server pushes request frames; the client dispatches them to the adapter concurrently and returns response frames matched by `request_id`. Reconnects automatically with exponential backoff.
 
